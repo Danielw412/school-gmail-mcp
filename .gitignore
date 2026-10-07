@@ -1,0 +1,16 @@
+# Build output
+backend/bin/
+
+# Data: the mail database and backups never go into Git
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db.gz
+
+# Secrets
+.env
+*.env
+*.token
+
+node_modules/

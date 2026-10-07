@@ -1,0 +1,29 @@
+# Installed as /etc/systemd/system/cloudflared.service by
+# deploy/install-cloudflared.sh (school-gmail-mcp).
+#
+# Runs the existing remotely managed tunnel "School Email Sync". Its public
+# hostname and origin (http://127.0.0.1:8766) are configured in the Cloudflare
+# dashboard. This matches the unit `cloudflared service install` writes, except
+# that the token comes from a root-only environment file instead of the command
+# line, so it is not visible in `ps` or `systemctl show`.
+[Unit]
+Description=cloudflared (Cloudflare Tunnel "School Email Sync")
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+TimeoutStartSec=0
+# TUNNEL_TOKEN=... (root:root 0600)
+EnvironmentFile=/etc/cloudflared/school-email-sync.env
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --metrics 127.0.0.1:20241 run
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

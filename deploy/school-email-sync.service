@@ -1,0 +1,49 @@
+# systemd *user* unit for the School Email Sync backend.
+# deploy/install-backend.sh replaces @REPO@ and installs it as
+# ~/.config/systemd/user/school-email-sync.service. Lingering is enabled for this
+# user, so the user manager (and this service) start at boot without a login.
+[Unit]
+Description=School Email Sync backend (127.0.0.1:8766)
+Documentation=file://@REPO@/README.md
+# Never give up restarting; RestartSteps below spaces attempts out instead.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/school-email-sync serve
+# SYNC_SECRET, API_SECRET and LISTEN_ADDR. Mode 0600, outside the repository.
+EnvironmentFile=%h/.config/school-email-sync/backend.env
+# The database lives in ~/.local/state/school-email-sync (exported as $STATE_DIRECTORY).
+StateDirectory=school-email-sync
+StateDirectoryMode=0700
+UMask=0077
+
+# --- Footprint ------------------------------------------------------------------
+# Keep the Go heap close to its live size and give glibc (used by SQLite's C code)
+# two malloc arenas instead of one per thread.
+Environment=GOGC=50
+Environment=GOMEMLIMIT=48MiB
+Environment=MALLOC_ARENA_MAX=2
+# Runaway guards, not working limits: normal use sits far below these.
+MemoryMax=192M
+TasksMax=64
+
+Restart=on-failure
+RestartSec=2
+RestartSteps=6
+RestartMaxDelaySec=120
+TimeoutStopSec=15
+
+# --- Sandboxing -----------------------------------------------------------------
+# Everything is read-only except the state directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target
