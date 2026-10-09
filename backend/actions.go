@@ -246,10 +246,14 @@ func (s *Store) GetAction(ctx context.Context, id string) (*Action, error) {
 	return getActionTx(ctx, s.db, id)
 }
 
-// CreateAction queues an action. With an idempotency key, repeating the same
-// request returns the original action (created=false); reusing the key for a
-// different request is a conflict.
-func (s *Store) CreateAction(ctx context.Context, typ string, p ActionPayload, idemKey string, maxAttempts int, now int64) (*Action, bool, error) {
+// CreateAction queues an action that Apps Script may perform from notBefore on
+// (0 = immediately). With an idempotency key, repeating the same request returns
+// the original action (created=false); reusing the key for a different request is
+// a conflict.
+func (s *Store) CreateAction(ctx context.Context, typ string, p ActionPayload, idemKey string, maxAttempts int, now, notBefore int64) (*Action, bool, error) {
+	if notBefore < now {
+		notBefore = now
+	}
 	payload, err := json.Marshal(p)
 	if err != nil {
 		return nil, false, err
@@ -284,7 +288,7 @@ func (s *Store) CreateAction(ctx context.Context, typ string, p ActionPayload, i
 	if _, err := tx.ExecContext(ctx, `INSERT INTO actions
 		(id, type, status, payload, idempotency_key, attempts, max_attempts, not_before, created_at, updated_at)
 		VALUES (?, ?, 'pending', ?, ?, 0, ?, ?, ?, ?)`,
-		id, typ, string(payload), key, maxAttempts, now, now, now); err != nil {
+		id, typ, string(payload), key, maxAttempts, notBefore, now, now); err != nil {
 		return nil, false, err
 	}
 	a, err := getActionTx(ctx, tx, id)
@@ -292,6 +296,26 @@ func (s *Store) CreateAction(ctx context.Context, typ string, p ActionPayload, i
 		return nil, false, err
 	}
 	return a, true, tx.Commit()
+}
+
+// FindRecentAction returns the newest action with exactly this type and payload
+// created at or after since that has not been cancelled or failed, or nil. It lets
+// the MCP tools recognise a repeated send request instead of mailing twice.
+func (s *Store) FindRecentAction(ctx context.Context, typ string, p ActionPayload, since int64) (*Action, error) {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	var id string
+	err = s.db.QueryRowContext(ctx, `SELECT id FROM actions WHERE type = ? AND payload = ? AND created_at >= ?
+		AND status NOT IN ('cancelled', 'failed') ORDER BY created_at DESC LIMIT 1`, typ, string(payload), since).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.GetAction(ctx, id)
 }
 
 // ClaimActions returns up to limit ready actions and leases them to the caller.

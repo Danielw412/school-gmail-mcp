@@ -9,6 +9,10 @@ minute it:
 2. reads Gmail changes since the last run (Gmail history API) and pushes new
    messages plus read/label changes to the backend in batches of at most 20.
 
+When an agent asks for an attachment, the script also downloads that one file for
+the backend: through its web app endpoint if you deploy one (step 9), otherwise with
+the next trigger run.
+
 It only reads mail, sends mail and creates drafts it sends right away. It never
 deletes, archives, labels or marks mail as read.
 
@@ -69,6 +73,8 @@ the sync uses absolute timestamps.
 
 Click **Save script properties**. Script Properties stay out of the code, so you can
 update `Code.gs` later without re-entering them.
+
+`ATTACHMENT_FETCH_SECRET` is only needed for the attachment web app (step 9).
 
 Optional overrides (same place, same names as `DEFAULTS` at the top of `Code.gs`):
 `INITIAL_SYNC_DAYS` (default 30), `BACKFILL_DAYS` (365), `MAX_FETCH_PER_RUN` (80),
@@ -147,6 +153,69 @@ The first run imports the last 30 days (`INITIAL_SYNC_DAYS`) gradually, about 80
 messages per minute. After that, an idle run takes about a second: one Gmail call and
 one backend call.
 
+## 9. Attachments (web app)
+
+Optional, but it makes `get_attachment` answer in seconds. Without it the backend
+hands attachment requests to the trigger (up to about a minute per file; nothing to
+set up). Either way the backend keeps no copy of the file.
+
+**Check first whether your school allows it.** Many Google Workspace domains do not
+let users publish web apps to *Anyone* (the admin setting for sharing outside the
+organization). If *Anyone* is missing from the list in step 3 below, stop here and
+use relay mode: leave `ATTACHMENT_FETCH_URL` out of `backend.env`. *Anyone within
+<your school>* does not work, because the server cannot sign in to Google.
+
+1. On the server, create the shared secret and add it to `backend.env` (keep the
+   output; it goes into Apps Script too):
+
+   ```bash
+   ~/.local/bin/school-email-sync gen-secret
+   ```
+
+2. In Apps Script: ⚙️ **Project Settings** → **Script Properties** → add
+   `ATTACHMENT_FETCH_SECRET` with that value. Use a new value, not `SYNC_SECRET`.
+3. **Deploy** → **New deployment** → gear icon → **Web app**:
+   * Description: `attachments`
+   * **Execute as: Me** (your school account; this is what lets it read Gmail)
+   * **Who has access: Anyone**
+
+   Click **Deploy**, authorize if asked, and copy the **Web app URL** (it ends in
+   `/exec`; never use the `/dev` test URL).
+4. Check the access setting: open the URL in a private/incognito window. You should
+   see `{"ok":false,"error":{"code":"method","message":"School Email Sync attachment
+   endpoint 1.1.0: POST only"}}`. A Google sign-in page means the deployment is not
+   public, and the backend will not be able to use it.
+5. In `~/.config/school-email-sync/backend.env` on the server:
+
+   ```bash
+   ATTACHMENT_FETCH_URL=https://script.google.com/macros/s/<id>/exec
+   ATTACHMENT_FETCH_SECRET=<the value from step 1>
+   ```
+
+   then `systemctl --user restart school-email-sync` and run
+   `deploy/smoke-test.sh` (it checks that the URL answers without sign-in).
+
+What "Anyone" exposes: only `doPost`/`doGet`. `doPost` answers only requests signed
+with `ATTACHMENT_FETCH_SECRET` (checked before Gmail is touched), at most 2 minutes
+old and never seen before, and returns one attachment of one message. Everything else
+gets a short error. The script runs as you, so it needs no extra permissions: the
+scopes in `appsscript.json` are unchanged.
+
+**After every change to `Code.gs`**, update the deployment, or the web app keeps
+running the old version (the trigger always uses the latest saved code): **Deploy** →
+**Manage deployments** → pencil icon → **Version: New version** → **Deploy**. The URL
+stays the same.
+
+To turn it off: **Manage deployments** → **Archive**, and remove the two lines from
+`backend.env`.
+
+### Mail synced before attachment metadata
+
+Run **`startAttachmentBackfill`** once. Over the next trigger runs it finds mail with
+attachments from the last `BACKFILL_DAYS` that the backend already stores and sends
+just their attachment metadata. `showStatus` shows the progress; the log says
+`attachment scan finished` at the end.
+
 ## Other helpers
 
 | Function | Purpose |
@@ -154,6 +223,7 @@ one backend call.
 | `showStatus` | sync position, queue length, scans in progress, unreported actions, backoff (never prints the secret) |
 | `runFullSyncNow` | one run now, up to about 5 minutes, ignoring backoff |
 | `startBackfill` | import older mail (`BACKFILL_DAYS`, default 365) over the next runs; already-stored mail is skipped |
+| `startAttachmentBackfill` | fill in attachment metadata (names, types, sizes, part IDs) for stored mail of the last `BACKFILL_DAYS`, over the next runs; reads only the MIME structure, never attachment content or bodies |
 | `resetSyncState` | forget the local sync position; the next run re-scans 30 days, and the backend skips what it already has |
 
 ## How it behaves
@@ -167,7 +237,8 @@ one backend call.
 * **Bounded:** each trigger run stops starting new work after 45 s. Uploads are
   limited to 20 messages or about 2 MB. Text bodies are cut at 200,000 characters
   and HTML bodies at 400,000 (flagged as truncated). Attachments are recorded as
-  metadata only: name, type, size, Gmail attachment ID.
+  metadata only: name, type, size, MIME part ID, Content-ID. Their content is never
+  read during sync.
 * **Skipped:** drafts, spam, trash and chats (`SKIP_LABELS`).
 * **Server offline:** nothing is lost. The script keeps its position, backs off (1,
   2, 4, 8, then 15 minutes) and catches up when the server returns.
@@ -188,11 +259,13 @@ one backend call.
 Google Workspace accounts allow 6 hours of trigger runtime per day. A one-minute
 trigger that is idle about 1 s per run uses roughly 25 minutes a day. UrlFetch (about
 1,500 calls a day when idle) and Gmail read quotas are far below their limits. GmailApp
-sending is subject to your account's daily send limit. If it is reached, send actions
+sending is subject to your account's daily send limit. Each attachment an agent reads costs two Gmail
+API reads (MIME structure and the file) and one web app or trigger execution. If it is reached, send actions
 are reported as retryable and retried later.
 
 ## Updating
 
 Paste the new `Code.gs` over the old one and save. Script Properties, the trigger
 and the sync state are kept. If `appsscript.json` changed, update it too and run
-any function once to accept new permissions.
+any function once to accept new permissions. If you use the attachment web app,
+publish a new version of its deployment (step 9).

@@ -24,9 +24,14 @@ UMask=0077
 Environment=GOGC=50
 Environment=GOMEMLIMIT=48MiB
 Environment=MALLOC_ARENA_MAX=2
-# Runaway guards, not working limits: normal use sits far below these.
-MemoryMax=192M
+# Runaway guards, not working limits: normal use sits far below these. Reading a
+# 10 MB attachment briefly needs about 60 MB plus the PDF converter.
+MemoryMax=256M
 TasksMax=64
+# If a hostile file makes a PDF converter (pdftotext/pdftoppm) hit MemoryMax, the
+# kernel kills that process (the backend raises its oom_score_adj); keep the
+# service running instead of stopping it.
+OOMPolicy=continue
 
 Restart=on-failure
 RestartSec=2

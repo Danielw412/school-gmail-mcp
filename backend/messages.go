@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"net/mail"
 	"os"
 	"regexp"
 	"sort"
@@ -125,18 +126,19 @@ func (m *MessageIn) validate() error {
 	if m.BodyHTML != nil && len(*m.BodyHTML) > maxBodyHTML {
 		return fmt.Errorf("bodyHtml: longer than %d bytes (truncate before sending)", maxBodyHTML)
 	}
-	if len(m.Attachments) > maxAttachments {
+	return validateAttachments(m.Attachments)
+}
+
+func validateAttachments(atts []AttachmentIn) error {
+	if len(atts) > maxAttachments {
 		return fmt.Errorf("attachments: more than %d", maxAttachments)
 	}
-	seen := make(map[string]bool, len(m.Attachments))
-	for i, a := range m.Attachments {
+	seen := make(map[string]bool, len(atts))
+	for i, a := range atts {
 		if !partIDPattern.MatchString(a.PartID) {
 			return fmt.Errorf("attachments[%d].partId: invalid", i)
 		}
-		key := a.PartID
-		if key == "" {
-			key = "#" + strconv.Itoa(i)
-		}
+		key := attachmentKey(a.PartID, i)
 		if seen[key] {
 			return fmt.Errorf("attachments[%d].partId: duplicate %q", i, a.PartID)
 		}
@@ -149,6 +151,15 @@ func (m *MessageIn) validate() error {
 		}
 	}
 	return nil
+}
+
+// attachmentKey is the stored part_id: Gmail's MIME part ID, or "#<position>" for a
+// part without one. Apps Script resolves both forms the same way when it fetches.
+func attachmentKey(partID string, i int) string {
+	if partID == "" {
+		return "#" + strconv.Itoa(i)
+	}
+	return partID
 }
 
 func validateLabelIDs(ids []string) error {
@@ -328,21 +339,114 @@ func (s *Store) upsertMessage(ctx context.Context, tx *sql.Tx, m *MessageIn, now
 	if err != nil {
 		return "", err
 	}
-	for i, a := range m.Attachments {
-		partID := a.PartID
-		if partID == "" {
-			partID = "#" + strconv.Itoa(i)
-		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO attachments
-			(gmail_id, part_id, filename, mime_type, size, gmail_attachment_id, content_id, is_inline)
-			VALUES (?,?,?,?,?,?,?,?)`,
-			m.ID, partID, a.Filename, strings.ToLower(a.MimeType), a.Size, a.AttachmentID,
-			strings.Trim(a.ContentID, "<> "), boolInt(a.Inline))
-		if err != nil {
-			return "", err
-		}
+	if err := insertAttachments(ctx, tx, m.ID, m.Attachments); err != nil {
+		return "", err
 	}
 	return "inserted", nil
+}
+
+// insertAttachments stores attachment metadata (never content) for a message whose
+// row already exists, then classifies body parts (see attachmentHiddenSQL).
+func insertAttachments(ctx context.Context, tx *sql.Tx, gmailID string, atts []AttachmentIn) error {
+	if len(atts) == 0 {
+		return nil
+	}
+	for i, a := range atts {
+		_, err := tx.ExecContext(ctx, `INSERT INTO attachments
+			(gmail_id, part_id, filename, mime_type, size, gmail_attachment_id, content_id, is_inline)
+			VALUES (?,?,?,?,?,?,?,?)`,
+			gmailID, attachmentKey(a.PartID, i), a.Filename, strings.ToLower(a.MimeType), a.Size, a.AttachmentID,
+			strings.Trim(a.ContentID, "<> "), boolInt(a.Inline))
+		if err != nil {
+			return err
+		}
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE attachments SET hidden = `+attachmentHiddenSQL+` WHERE gmail_id = ?`, gmailID)
+	return err
+}
+
+// attachmentFingerprint describes a message's attachment metadata so a refresh can
+// tell whether anything changed. Gmail's attachment IDs are left out: they differ
+// on every API read.
+func attachmentFingerprint(rows [][6]string) string {
+	sort.Slice(rows, func(i, j int) bool { return rows[i][0] < rows[j][0] })
+	b, _ := json.Marshal(rows)
+	return string(b)
+}
+
+// MessageAttachments is the metadata-only refresh of one stored message (backfill).
+type MessageAttachments struct {
+	ID          string         `json:"id"`
+	Attachments []AttachmentIn `json:"attachments"`
+}
+
+// ReplaceAttachments refreshes the attachment metadata of messages that are already
+// stored, for mail synced before attachment metadata was complete. Unknown IDs are
+// returned so the caller can skip them; nothing else about a message changes.
+func (s *Store) ReplaceAttachments(ctx context.Context, items []MessageAttachments, now int64) (StateSummary, error) {
+	sum := StateSummary{Received: len(items), Unknown: []string{}}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return sum, err
+	}
+	defer tx.Rollback()
+	for _, it := range items {
+		err := validateAttachments(it.Attachments)
+		if !gmailIDPattern.MatchString(it.ID) {
+			err = errors.New("id: invalid")
+		}
+		if err != nil {
+			sum.Rejected++
+			sum.Errors = append(sum.Errors, ItemResult{ID: truncateForError(it.ID), Status: "rejected", Error: err.Error()})
+			continue
+		}
+		var one int
+		err = tx.QueryRowContext(ctx, `SELECT 1 FROM messages WHERE gmail_id = ?`, it.ID).Scan(&one)
+		if errors.Is(err, sql.ErrNoRows) {
+			sum.Unknown = append(sum.Unknown, it.ID)
+			continue
+		}
+		if err != nil {
+			return sum, err
+		}
+		var old [][6]string
+		rows, err := tx.QueryContext(ctx, `SELECT part_id, filename, mime_type, size, content_id, is_inline FROM attachments WHERE gmail_id = ?`, it.ID)
+		if err != nil {
+			return sum, err
+		}
+		for rows.Next() {
+			var r [6]string
+			if err := rows.Scan(&r[0], &r[1], &r[2], &r[3], &r[4], &r[5]); err != nil {
+				rows.Close()
+				return sum, err
+			}
+			old = append(old, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return sum, err
+		}
+		fresh := make([][6]string, len(it.Attachments))
+		for i, a := range it.Attachments {
+			fresh[i] = [6]string{attachmentKey(a.PartID, i), a.Filename, strings.ToLower(a.MimeType),
+				strconv.FormatInt(a.Size, 10), strings.Trim(a.ContentID, "<> "), strconv.Itoa(boolInt(a.Inline))}
+		}
+		if attachmentFingerprint(old) == attachmentFingerprint(fresh) {
+			sum.Unchanged++
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM attachments WHERE gmail_id = ?`, it.ID); err != nil {
+			return sum, err
+		}
+		if err := insertAttachments(ctx, tx, it.ID, it.Attachments); err != nil {
+			return sum, err
+		}
+		sum.Updated++
+	}
+	if err := setKVTx(ctx, tx, "last_attachment_backfill", strconv.Itoa(sum.Updated), now); err != nil {
+		return sum, err
+	}
+	return sum, tx.Commit()
 }
 
 type StateSummary struct {
@@ -513,22 +617,24 @@ func (s *Store) labelNames(ctx context.Context) (map[string]string, error) {
 // Reading
 
 type SearchParams struct {
-	Text      string // plain words, safely converted to an FTS5 query
-	FTS       string // raw FTS5 query syntax
-	From      string
-	To        string // matches To or Cc
-	Subject   string
-	Label     string // label ID or display name
-	ThreadID  string
-	Unread    *bool
-	Starred   *bool
-	InInbox   *bool
-	After     int64 // ms, inclusive
-	Before    int64 // ms, exclusive
-	Limit     int
-	CursorTS  int64
-	CursorID  string
-	WithTrash bool
+	Text       string // plain words, safely converted to an FTS5 query
+	FTS        string // raw FTS5 query syntax
+	From       string
+	To         string // matches To or Cc
+	Subject    string
+	Label      string // label ID or display name
+	ThreadID   string
+	Unread     *bool
+	Starred    *bool
+	InInbox    *bool
+	HasAttach  *bool  // has an attachment that is not part of the body (see attachmentHiddenSQL)
+	AttachName string // attachment filename contains
+	After      int64  // ms, inclusive
+	Before     int64  // ms, exclusive
+	Limit      int
+	CursorTS   int64
+	CursorID   string
+	WithTrash  bool
 }
 
 type MessageSummary struct {
@@ -607,9 +713,11 @@ func (s *Store) Search(ctx context.Context, p SearchParams) ([]MessageSummary, s
 		args = append(args, likeArg(p.Subject))
 	}
 	if p.Label != "" {
+		// Gmail writes spaces in label names as hyphens (label:robotics-club).
 		where = append(where, `EXISTS (SELECT 1 FROM json_each(m.label_ids) j WHERE j.value = ?
-			OR j.value IN (SELECT label_id FROM labels WHERE name = ? COLLATE NOCASE))`)
-		args = append(args, p.Label, p.Label)
+			OR j.value IN (SELECT label_id FROM labels WHERE name = ? COLLATE NOCASE
+			OR replace(name, ' ', '-') = ? COLLATE NOCASE))`)
+		args = append(args, p.Label, p.Label, p.Label)
 	}
 	if p.ThreadID != "" {
 		where = append(where, `m.thread_id = ?`)
@@ -620,6 +728,17 @@ func (s *Store) Search(ctx context.Context, p SearchParams) ([]MessageSummary, s
 			where = append(where, col+` = ?`)
 			args = append(args, boolInt(*v))
 		}
+	}
+	if p.HasAttach != nil {
+		cond := `EXISTS (SELECT 1 FROM attachments a WHERE a.gmail_id = m.gmail_id AND a.hidden = 0)`
+		if !*p.HasAttach {
+			cond = "NOT " + cond
+		}
+		where = append(where, cond)
+	}
+	if p.AttachName != "" {
+		where = append(where, `EXISTS (SELECT 1 FROM attachments a WHERE a.gmail_id = m.gmail_id AND a.filename LIKE ? ESCAPE '\')`)
+		args = append(args, likeArg(p.AttachName))
 	}
 	if !p.WithTrash {
 		where = append(where, `m.in_trash = 0 AND m.in_spam = 0 AND m.gmail_deleted = 0`)
@@ -639,7 +758,7 @@ func (s *Store) Search(ctx context.Context, p SearchParams) ([]MessageSummary, s
 
 	q := `SELECT m.gmail_id, m.thread_id, m.from_addr, m.to_addrs, m.cc_addrs, m.subject, m.internal_date,
 		m.snippet, m.label_ids, m.is_unread, m.is_starred, m.in_inbox,
-		(SELECT count(*) FROM attachments a WHERE a.gmail_id = m.gmail_id AND a.is_inline = 0)
+		(SELECT count(*) FROM attachments a WHERE a.gmail_id = m.gmail_id AND a.hidden = 0)
 		FROM messages m`
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -684,6 +803,24 @@ func (s *Store) Search(ctx context.Context, p SearchParams) ([]MessageSummary, s
 	return out, next, nil
 }
 
+// AccountEmail guesses the mailbox owner's address from the sender of sent mail.
+// It returns "" until at least one sent message has been synced.
+func (s *Store) AccountEmail(ctx context.Context) (string, error) {
+	var from string
+	err := s.db.QueryRowContext(ctx, `SELECT from_addr FROM messages WHERE in_sent = 1 AND from_addr != ''
+		GROUP BY from_addr ORDER BY count(*) DESC LIMIT 1`).Scan(&from)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if a, err := mail.ParseAddress(from); err == nil {
+		return strings.ToLower(a.Address), nil
+	}
+	return "", nil
+}
+
 func isFTSSyntaxError(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "fts5") || strings.Contains(s, "syntax error") ||
@@ -709,8 +846,8 @@ type AttachmentOut struct {
 	Size         int64  `json:"size"`
 	AttachmentID string `json:"attachmentId,omitempty"`
 	ContentID    string `json:"contentId,omitempty"`
-	Inline       bool   `json:"inline"`
-	FetchState   string `json:"fetchState"`
+	Inline       bool   `json:"inline"` // Content-Disposition: inline
+	Hidden       bool   `json:"hidden"` // part of the body, e.g. a signature logo
 }
 
 type MessageOut struct {
@@ -797,7 +934,7 @@ func (s *Store) attachmentsFor(ctx context.Context, ids []string) (map[string][]
 		args[i] = id
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT gmail_id, part_id, filename, mime_type, size, gmail_attachment_id,
-		content_id, is_inline, fetch_state FROM attachments WHERE gmail_id IN (?`+strings.Repeat(",?", len(ids)-1)+`)
+		content_id, is_inline, hidden FROM attachments WHERE gmail_id IN (?`+strings.Repeat(",?", len(ids)-1)+`)
 		ORDER BY gmail_id, id`, args...)
 	if err != nil {
 		return nil, err
@@ -806,12 +943,39 @@ func (s *Store) attachmentsFor(ctx context.Context, ids []string) (map[string][]
 	for rows.Next() {
 		var gid string
 		var a AttachmentOut
-		var inline int
-		if err := rows.Scan(&gid, &a.PartID, &a.Filename, &a.MimeType, &a.Size, &a.AttachmentID, &a.ContentID, &inline, &a.FetchState); err != nil {
+		var inline, hidden int
+		if err := rows.Scan(&gid, &a.PartID, &a.Filename, &a.MimeType, &a.Size, &a.AttachmentID, &a.ContentID, &inline, &hidden); err != nil {
 			return nil, err
 		}
-		a.Inline = inline == 1
+		a.Inline, a.Hidden = inline == 1, hidden == 1
 		out[gid] = append(out[gid], a)
+	}
+	return out, rows.Err()
+}
+
+type RecentAttachment struct {
+	MessageID, PartID, Filename, MimeType, Subject, From string
+	Size, InternalDate                                   int64
+}
+
+// RecentAttachments lists the newest real attachments (not body parts) of mail that
+// is neither trashed nor deleted.
+func (s *Store) RecentAttachments(ctx context.Context, limit int) ([]RecentAttachment, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT a.gmail_id, a.part_id, a.filename, a.mime_type, a.size, m.subject, m.from_addr, m.internal_date
+		FROM attachments a JOIN messages m ON m.gmail_id = a.gmail_id
+		WHERE a.hidden = 0 AND m.in_trash = 0 AND m.in_spam = 0 AND m.gmail_deleted = 0
+		ORDER BY m.internal_date DESC, a.id LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RecentAttachment
+	for rows.Next() {
+		var r RecentAttachment
+		if err := rows.Scan(&r.MessageID, &r.PartID, &r.Filename, &r.MimeType, &r.Size, &r.Subject, &r.From, &r.InternalDate); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }

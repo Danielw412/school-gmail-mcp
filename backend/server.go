@@ -46,18 +46,36 @@ type Server struct {
 	authLogMu   sync.Mutex
 	authLogLast time.Time
 	authLogSkip int
+
+	tools     []*mcpTool // MCP tools, built by mcpRoutes
+	accountMu sync.Mutex
+	account   string // mailbox owner's address, once known
+
+	fetcher   attachmentFetcher // downloads attachments through Apps Script
+	relay     *attachmentRelay  // set when fetcher is the poll relay
+	conv      *converter
+	attachSem chan struct{} // attachment downloads in progress (bounds memory)
 }
 
 func newServer(cfg Config, store *Store, logger *slog.Logger, now func() time.Time) *Server {
-	return &Server{
-		cfg:      cfg,
-		store:    store,
-		log:      logger,
-		now:      now,
-		syncHash: sha256.Sum256([]byte(cfg.SyncSecret)),
-		apiHash:  sha256.Sum256([]byte(cfg.APISecret)),
-		sem:      make(chan struct{}, maxConcurrent),
+	s := &Server{
+		cfg:       cfg,
+		store:     store,
+		log:       logger,
+		now:       now,
+		syncHash:  sha256.Sum256([]byte(cfg.SyncSecret)),
+		apiHash:   sha256.Sum256([]byte(cfg.APISecret)),
+		sem:       make(chan struct{}, maxConcurrent),
+		conv:      &converter{log: logger},
+		attachSem: make(chan struct{}, 2),
 	}
+	if cfg.AttachmentFetchURL != "" {
+		s.fetcher = newWebAppFetcher(cfg.AttachmentFetchURL, cfg.AttachmentFetchSecret, cfg.AttachmentFetchTimeout, now)
+	} else {
+		s.relay = newAttachmentRelay(now)
+		s.fetcher = s.relay
+	}
+	return s
 }
 
 func (s *Server) nowMS() int64 { return s.now().UnixMilli() }
@@ -76,6 +94,8 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("POST /v1/actions/poll", s.guard(roleSync, maxSmallBody, s.handlePoll))
 	mux.Handle("POST /v1/actions/{id}/complete", s.guard(roleSync, maxSmallBody, s.handleComplete))
 	mux.Handle("POST /v1/actions/{id}/fail", s.guard(roleSync, maxSmallBody, s.handleFail))
+	mux.Handle("POST /v1/sync/attachments", s.guard(roleSync, maxIngestBody, s.handleAttachmentMetadata))
+	mux.Handle("POST /v1/attachments/relay/{id}", s.guard(roleSync, relayMaxBody(max(s.cfg.AttachmentMaxBytes, 1<<10)), s.handleRelayUpload))
 
 	// Local clients (API_SECRET; refused through the tunnel unless ALLOW_REMOTE_CLIENT_API).
 	mux.Handle("POST /v1/actions", s.guard(roleClient, maxActionRequestBody, s.handleCreateAction))
@@ -517,14 +537,21 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, r, err)
 		return
 	}
-	if len(actions) == 0 {
-		markQuiet(w)
-	} else {
-		for _, a := range actions {
-			s.log.Info("action claimed", "id", a.ID, "type", a.Type, "attempt", a.Attempt)
+	for _, a := range actions {
+		s.log.Info("action claimed", "id", a.ID, "type", a.Type, "attempt", a.Attempt)
+	}
+	out := map[string]any{"actions": actions, "serverTime": s.now().UTC().Format(time.RFC3339)}
+	// Attachment downloads waiting for Apps Script ride along (relay mode only).
+	if s.relay != nil {
+		if reqs := s.relay.Claim(3); len(reqs) > 0 {
+			out["attachmentRequests"] = reqs
+			s.log.Info("attachment requests claimed", "count", len(reqs))
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"actions": actions, "serverTime": s.now().UTC().Format(time.RFC3339)})
+	if out["attachmentRequests"] == nil && len(actions) == 0 {
+		markQuiet(w)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
@@ -593,7 +620,7 @@ func (s *Server) handleCreateAction(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, err)
 		return
 	}
-	a, created, err := s.store.CreateAction(r.Context(), req.Type, payload, req.IdempotencyKey, s.cfg.ActionMaxAttempts, s.nowMS())
+	a, created, err := s.store.CreateAction(r.Context(), req.Type, payload, req.IdempotencyKey, s.cfg.ActionMaxAttempts, s.nowMS(), 0)
 	if err != nil {
 		s.storeError(w, r, err)
 		return

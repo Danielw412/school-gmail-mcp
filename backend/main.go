@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -77,39 +78,70 @@ func cmdServe() error {
 	defer store.Close()
 
 	srv := newServer(cfg, store, logger, time.Now)
-	httpSrv := &http.Server{
-		Handler:           srv.routes(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    32 << 10,
-		ErrorLog:          newStdLogger(logger),
-	}
+	httpSrv := newHTTPServer(srv.routes(), logger, 60*time.Second)
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
 	logger.Info("listening", "addr", ln.Addr().String(), "db", cfg.DBPath, "version", version)
+	servers := []*http.Server{httpSrv}
+	listeners := []net.Listener{ln}
+
+	// The MCP endpoint gets its own loopback port: only LISTEN_ADDR is routed by
+	// Cloudflare, so the mailbox tools are reachable solely via the OpenAI tunnel.
+	if cfg.MCPListenAddr != "" {
+		mcpLn, err := net.Listen("tcp", cfg.MCPListenAddr)
+		if err != nil {
+			ln.Close()
+			return fmt.Errorf("MCP_LISTEN_ADDR: %w", err)
+		}
+		// get_attachment may wait for Gmail and then convert the file.
+		mcpWrite := max(60*time.Second, cfg.AttachmentFetchTimeout+cfg.AttachmentConvertTimeout+15*time.Second)
+		servers = append(servers, newHTTPServer(srv.mcpRoutes(), logger, mcpWrite))
+		listeners = append(listeners, mcpLn)
+		logger.Info("mcp listening", "addr", mcpLn.Addr().String(), "send_enabled", cfg.MCPAllowSend,
+			"send_delay_s", int(cfg.MCPSendDelay.Seconds()), "attachments", srv.fetcher.Mode(),
+			"attachment_max_bytes", cfg.AttachmentMaxBytes)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- httpSrv.Serve(ln) }()
+	errCh := make(chan error, len(servers))
+	for i := range servers {
+		go func(s *http.Server, l net.Listener) { errCh <- s.Serve(l) }(servers[i], listeners[i])
+	}
 
+	var serveErr error
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
-			return err
+			serveErr = err
 		}
 	}
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return httpSrv.Shutdown(shutdownCtx)
+	for _, s := range servers {
+		if err := s.Shutdown(shutdownCtx); err != nil && serveErr == nil {
+			serveErr = err
+		}
+	}
+	return serveErr
+}
+
+func newHTTPServer(h http.Handler, logger *slog.Logger, writeTimeout time.Duration) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    32 << 10,
+		ErrorLog:          newStdLogger(logger),
+	}
 }
 
 func cmdBackup(args []string) error {

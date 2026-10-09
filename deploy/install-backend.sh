@@ -72,6 +72,12 @@ if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]];
   echo "         Fix with: sudo loginctl enable-linger $USER" >&2
 fi
 
+# Attachment conversion (optional tools).
+command -v pdftotext >/dev/null && command -v pdftoppm >/dev/null ||
+  echo "NOTE: install poppler-utils for PDF text in get_attachment (sudo apt install poppler-utils)." >&2
+command -v bwrap >/dev/null ||
+  echo "NOTE: install bubblewrap so PDF converters run sandboxed (sudo apt install bubblewrap)." >&2
+
 # 4. Wait for the health check.
 addr="$(sed -n 's/^LISTEN_ADDR=//p' "$ENV_FILE" | tail -n1)"
 addr="${addr:-127.0.0.1:8766}"

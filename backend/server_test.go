@@ -55,6 +55,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	cfg := Config{
 		ListenAddr: "127.0.0.1:0", SyncSecret: testSyncSecret, APISecret: testAPISecret,
 		ActionLease: 10 * time.Minute, ActionMaxAttempts: 3,
+		AttachmentMaxBytes: 10 << 20, AttachmentFetchTimeout: 5 * time.Second, AttachmentConvertTimeout: 15 * time.Second,
 	}
 	clock := &fakeClock{t: time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)}
 	srv := newServer(cfg, store, newLoggerTo(io.Discard, slog.LevelError), clock.Now)
@@ -188,6 +189,7 @@ func TestUnauthenticatedRequestsRejected(t *testing.T) {
 		{"GET", "/v1/sync/ping"}, {"POST", "/v1/sync/messages"}, {"POST", "/v1/sync/message"},
 		{"POST", "/v1/sync/known"}, {"POST", "/v1/sync/state"}, {"POST", "/v1/sync/labels"},
 		{"POST", "/v1/actions/poll"}, {"POST", "/v1/actions/act_x/complete"}, {"POST", "/v1/actions/act_x/fail"},
+		{"POST", "/v1/sync/attachments"}, {"POST", "/v1/attachments/relay/att_x"},
 	}
 	clientRoutes := [][2]string{
 		{"POST", "/v1/actions"}, {"GET", "/v1/actions"}, {"GET", "/v1/actions/act_x"},
@@ -259,7 +261,7 @@ func TestIngestSingleMessage(t *testing.T) {
 	}
 	atts := list(m["attachments"])
 	if len(atts) != 1 || str(obj(atts[0])["filename"]) != "permission.pdf" ||
-		num(obj(atts[0])["size"]) != 48213 || str(obj(atts[0])["fetchState"]) != "none" ||
+		num(obj(atts[0])["size"]) != 48213 || obj(atts[0])["hidden"] != false ||
 		str(obj(atts[0])["attachmentId"]) != "ANGjdJ8-example" {
 		t.Fatalf("attachment metadata wrong: %v", atts)
 	}

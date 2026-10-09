@@ -1,0 +1,38 @@
+# systemd *user* unit: the OpenAI Secure MCP Tunnel that connects ChatGPT to the
+# backend's MCP endpoint (127.0.0.1:8767). deploy/install-chatgpt-tunnel.sh
+# replaces @REPO@ and installs it as
+# ~/.config/systemd/user/school-email-sync-chatgpt.service.
+#
+# tunnel-client only makes outbound connections to api.openai.com; nothing is
+# published on this machine. Its local status page is http://127.0.0.1:8081/ui.
+[Unit]
+Description=OpenAI Secure MCP Tunnel for School Gmail (ChatGPT, profile school-gmail)
+Documentation=file://@REPO@/README.md
+Wants=school-email-sync.service
+After=school-email-sync.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+# CONTROL_PLANE_API_KEY=... (mode 0600). The profile reads it as env:CONTROL_PLANE_API_KEY.
+EnvironmentFile=%h/.config/school-email-sync/chatgpt-tunnel.env
+# Profile: ~/.config/tunnel-client/school-gmail.yaml (tunnel id, MCP URL, health port).
+ExecStart=/usr/local/bin/tunnel-client run --profile school-gmail
+Restart=always
+RestartSec=5
+RestartSteps=6
+RestartMaxDelaySec=120
+TimeoutStopSec=15
+
+# tunnel-client is a Go program: keep its heap near the live size.
+Environment=GOGC=50
+MemoryMax=256M
+TasksMax=64
+
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

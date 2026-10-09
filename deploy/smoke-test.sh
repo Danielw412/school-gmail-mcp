@@ -49,6 +49,43 @@ check "backend listens on loopback only" "${LOCAL#http://} " "$listen"
 check "local /healthz" 200 "$(status "$LOCAL/healthz" '')"
 check "cloudflared /ready (tunnel connected)" 200 "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:20241/ready)"
 
+echo "ChatGPT (MCP)"
+MCP_ADDR="$(setting MCP_LISTEN_ADDR)"
+MCP_ADDR="${MCP_ADDR:-127.0.0.1:8767}"
+if [[ $MCP_ADDR == off ]]; then
+  echo "  skipped (MCP_LISTEN_ADDR=off)"
+else
+  mlisten="$(ss -Htln "sport = :${MCP_ADDR##*:}" | awk '{print $4}' | sort -u | tr '\n' ' ')"
+  check "MCP endpoint listens on loopback only" "$MCP_ADDR " "$mlisten"
+  init="$(curl -s --max-time 5 -H 'Content-Type: application/json' "http://$MCP_ADDR/mcp" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1"}}}')"
+  check "MCP initialize answers as school-gmail" yes "$(grep -q '"name":"school-gmail"' <<<"$init" && echo yes || echo no)"
+  check "MCP refuses a foreign Host (DNS rebinding)" 403 "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    -H 'Host: evil.example' -H 'Content-Type: application/json' -d '{}' "http://$MCP_ADDR/mcp")"
+  tools="$(curl -s --max-time 5 -H 'Content-Type: application/json' "http://$MCP_ADDR/mcp" \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')"
+  check "MCP offers get_attachment" yes "$(grep -q '"name":"get_attachment"' <<<"$tools" && echo yes || echo no)"
+  if systemctl --user cat school-email-sync-chatgpt >/dev/null 2>&1; then
+    check "ChatGPT tunnel service enabled" enabled "$(systemctl --user is-enabled school-email-sync-chatgpt 2>/dev/null)"
+    check "ChatGPT tunnel service active" active "$(systemctl --user is-active school-email-sync-chatgpt 2>/dev/null)"
+    check "ChatGPT tunnel ready" 200 "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8081/readyz)"
+  else
+    echo "  ChatGPT tunnel not installed yet (deploy/install-chatgpt-tunnel.sh)"
+  fi
+fi
+
+echo "Attachments"
+command -v pdftotext >/dev/null && ok "pdftotext installed (PDF text)" || bad "pdftotext missing: sudo apt install poppler-utils"
+command -v bwrap >/dev/null && ok "bwrap installed (converter sandbox)" || bad "bwrap missing: sudo apt install bubblewrap"
+FETCH_URL="$(setting ATTACHMENT_FETCH_URL)"
+if [[ -z $FETCH_URL ]]; then
+  echo "  ATTACHMENT_FETCH_URL not set: attachments are relayed through the sync trigger"
+else
+  # GET answers with doGet's JSON only when the deployment allows anonymous access.
+  page="$(curl -sL --max-time 20 ${DOH_URL:+--doh-url "$DOH_URL"} "$FETCH_URL")"
+  check "Apps Script web app reachable without sign-in" yes "$(grep -q 'attachment endpoint' <<<"$page" && echo yes || echo no)"
+fi
+
 if [[ -z $PUBLIC ]]; then
   echo "Public checks skipped (usage: $0 https://your-hostname)"
 else
@@ -62,6 +99,8 @@ else
   check "client API refused remotely (send)" 403 "$(status "$PUBLIC/v1/actions" "$API" -X POST -H 'Content-Type: application/json' \
     --data '{"type":"send","to":["nobody@example.org"],"subject":"x","body":"x"}')"
   check "malformed payload -> 400" 400 "$(status "$PUBLIC/v1/sync/messages" "$SYNC" -X POST -H 'Content-Type: application/json' --data '{"messages":')"
+  check "attachment relay needs the Apps Script secret" 401 "$(status "$PUBLIC/v1/attachments/relay/att_x" '' -X POST -H 'Content-Type: application/json' --data '{}')"
+  check "MCP endpoint not exposed publicly" 404 "$(status "$PUBLIC/mcp" '' -X POST -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"ping"}')"
 fi
 
 echo "$pass passed, $fail failed"

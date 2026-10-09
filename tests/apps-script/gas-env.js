@@ -4,6 +4,7 @@
 // uses. UrlFetchApp performs real (synchronous) HTTP requests so the script talks
 // to a real backend; the Gmail fakes keep an in-memory mailbox with history.
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
@@ -71,7 +72,7 @@ class FakeMailbox {
     this.attData = {};
     this.sent = [];
     this.sendFailure = null;
-    this.calls = { get: 0, list: 0, history: 0 };
+    this.calls = { get: 0, list: 0, history: 0, attachmentGet: 0, getOpts: [] };
   }
 
   newId() {
@@ -120,16 +121,8 @@ class FakeMailbox {
     const alt = [];
     if (spec.text !== undefined) alt.push(this.textPart('0.0', 'text/plain', spec.text, spec));
     if (spec.html !== undefined) alt.push(this.textPart('0.1', 'text/html', spec.html, { form: spec.form }));
-    const parts = [{ partId: '0', mimeType: 'multipart/alternative', filename: '', headers: [], body: { size: 0 }, parts: alt }];
-    (spec.attachments || []).forEach((a, i) => {
-      const h = [{ name: 'Content-Type', value: a.mimeType }];
-      h.push({ name: 'Content-Disposition', value: `${a.inline ? 'inline' : 'attachment'}; filename="${a.filename}"` });
-      if (a.contentId) h.push({ name: 'Content-ID', value: `<${a.contentId}>` });
-      parts.push({
-        partId: String(i + 1), mimeType: a.mimeType, filename: a.filename, headers: h,
-        body: { attachmentId: 'ANGjdJ_' + this.newId(), size: a.size },
-      });
-    });
+    const parts = spec.parts || [{ partId: '0', mimeType: 'multipart/alternative', filename: '', headers: [], body: { size: 0 }, parts: alt }];
+    (spec.attachments || []).forEach((a, i) => parts.push(this.attachmentPart(String(i + 1), a)));
     const payload = { partId: '', mimeType: 'multipart/mixed', filename: '', headers, body: { size: 0 }, parts };
 
     this.historyId += 1;
@@ -140,6 +133,32 @@ class FakeMailbox {
     this.msgs.set(id, msg);
     this.history.push({ id: String(this.historyId), messagesAdded: [{ message: { id, threadId, labelIds: labelIds.slice() } }] });
     return id;
+  }
+
+  /**
+   * An attachment part. With a.data (Buffer) the content can be downloaded; it is
+   * kept out of line (attachmentId) unless a.inData, and encoded as base64url or as
+   * a byte array (a.form), as the Gmail advanced service may return either.
+   */
+  attachmentPart(partId, a) {
+    const h = [{ name: 'Content-Type', value: a.mimeType }];
+    h.push({ name: 'Content-Disposition', value: `${a.inline ? 'inline' : 'attachment'}; filename="${a.filename}"` });
+    if (a.contentId) h.push({ name: 'Content-ID', value: `<${a.contentId}>` });
+    const size = a.data ? a.data.length : a.size;
+    const part = { partId, mimeType: a.mimeType, filename: a.filename, headers: h, body: { size } };
+    const encoded = a.data && (a.form === 'bytes' ? toSignedBytes(a.data) : a.data.toString('base64url'));
+    if (a.inData) {
+      part.body.data = encoded;
+    } else {
+      part.body.attachmentId = 'ANGjdJ_' + this.newId();
+      if (a.data) this.attData[part.body.attachmentId] = encoded;
+    }
+    return part;
+  }
+
+  hasAttachment(m) {
+    const walk = (p) => !!p && (!!p.filename || (p.parts || []).some(walk));
+    return walk(m.payload);
   }
 
   setLabels(id, labelIds) {
@@ -191,18 +210,27 @@ class FakeMailbox {
           },
         },
         Messages: {
-          get: (user, id) => {
+          get: (user, id, opts) => {
             box.calls.get += 1;
+            box.calls.getOpts.push(Object.assign({}, opts || {}));
             const m = box.msgs.get(id);
             if (!m) throw box.notFound('messages.get');
-            return JSON.parse(JSON.stringify(m));
+            const copy = JSON.parse(JSON.stringify(m));
+            if (opts && opts.fields) {
+              // Partial response: the MIME tree without body data.
+              const strip = (p) => { if (p.body) delete p.body.data; (p.parts || []).forEach(strip); };
+              strip(copy.payload);
+            }
+            return copy;
           },
           list: (user, opts) => {
             box.calls.list += 1;
             const after = Number((/after:(\d+)/.exec(opts.q || '') || [0, 0])[1]) * 1000;
             const noDrafts = /-in:drafts/.test(opts.q || '');
+            const withAtt = /has:attachment/.test(opts.q || '');
             const all = [...box.msgs.values()]
               .filter((m) => Number(m.internalDate) >= after)
+              .filter((m) => !withAtt || box.hasAttachment(m))
               .filter((m) => opts.includeSpamTrash || !m.labelIds.some((l) => l === 'SPAM' || l === 'TRASH'))
               .filter((m) => !noDrafts || !m.labelIds.includes('DRAFT'))
               .sort((a, b) => Number(b.internalDate) - Number(a.internalDate));
@@ -216,6 +244,7 @@ class FakeMailbox {
           },
           Attachments: {
             get: (user, messageId, attachmentId) => {
+              if (!attachmentId.startsWith('ANGjdJ_text_')) box.calls.attachmentGet += 1;
               if (!(attachmentId in box.attData)) throw box.notFound('messages.attachments.get');
               return { size: 1, data: box.attData[attachmentId] };
             },
@@ -323,9 +352,24 @@ function createRuntime({ me = 'student@school.example.org', rewriteUrl = (u) => 
     if (rt.verbose) process.stderr.write(`    [gas ${level}] ${line}\n`);
   };
 
+  const cache = new Map();
+  const signed = (buf) => toSignedBytes(buf);
   const sandbox = {
     console: { log: log('log'), info: log('info'), warn: log('warn'), error: log('error') },
     PropertiesService: { getScriptProperties: () => store },
+    CacheService: {
+      getScriptCache: () => ({
+        get: (k) => (cache.has(k) ? cache.get(k) : null),
+        put: (k, v) => { cache.set(k, String(v)); },
+      }),
+    },
+    ContentService: {
+      MimeType: { JSON: 'JSON' },
+      createTextOutput: (text) => {
+        const out = { text, mimeType: 'TEXT', getContent: () => text, setMimeType: (m) => { out.mimeType = m; return out; } };
+        return out;
+      },
+    },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
     UrlFetchApp: {
       fetch: (url, params) => {
@@ -336,7 +380,12 @@ function createRuntime({ me = 'student@school.example.org', rewriteUrl = (u) => 
     },
     Utilities: {
       sleep: () => {},
+      Charset: { UTF_8: 'UTF_8', US_ASCII: 'US_ASCII' },
+      DigestAlgorithm: { SHA_256: 'sha256' },
       base64Decode: (s) => toSignedBytes(Buffer.from(s, 'base64')),
+      base64Encode: (bytes) => Buffer.from(bytes.map((b) => b & 0xff)).toString('base64'),
+      computeDigest: (alg, value) => signed(crypto.createHash(alg).update(String(value), 'utf8').digest()),
+      computeHmacSha256Signature: (value, key) => signed(crypto.createHmac('sha256', String(key)).update(String(value), 'utf8').digest()),
       newBlob: (bytes) => ({
         getDataAsString: (charset) => new TextDecoder(String(charset || 'utf-8').toLowerCase(), { fatal: false })
           .decode(Buffer.from(bytes.map((b) => b & 0xff))),
@@ -365,6 +414,7 @@ function createRuntime({ me = 'student@school.example.org', rewriteUrl = (u) => 
   rt.ctx = ctx;
   rt.call = (fn, ...args) => ctx[fn](...args);
   rt.logText = () => logs.map((l) => l.line).join('\n');
+  rt.cache = cache;
   rt.clearLogs = () => { logs.length = 0; };
   return rt;
 }

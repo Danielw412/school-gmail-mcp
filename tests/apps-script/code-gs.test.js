@@ -12,9 +12,10 @@
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
+const http = require('http');
 const net = require('net');
 const os = require('os');
 const path = require('path');
@@ -26,8 +27,10 @@ const FAKE_URL = 'https://backend.test';
 const DAY = 86400000;
 
 let localBase;
+let mcpBase;
 let syncSecret;
 let apiSecret;
+const fetchSecret = 'fetch-' + crypto.randomBytes(24).toString('hex');
 let backend;
 let tmpDir;
 let rt;
@@ -57,13 +60,14 @@ async function waitHealthy(timeoutMs = 10000) {
   throw new Error('backend did not become healthy');
 }
 
-async function startBackend() {
+async function startBackend(extraEnv = {}) {
   const bin = process.env.SES_BACKEND_BIN || path.join(REPO, 'backend', 'bin', 'school-email-sync');
   backend = spawn(bin, ['serve'], {
-    env: {
+    env: Object.assign({
       PATH: process.env.PATH, LISTEN_ADDR: new URL(localBase).host, DB_PATH: path.join(tmpDir, 'mail.db'),
       SYNC_SECRET: syncSecret, API_SECRET: apiSecret, LOG_LEVEL: process.env.VERBOSE ? 'debug' : 'error',
-    },
+      MCP_LISTEN_ADDR: new URL(mcpBase).host, // a free port: the installed service uses the default one
+    }, extraEnv),
     stdio: ['ignore', 'inherit', 'inherit'],
   });
   await waitHealthy();
@@ -127,6 +131,7 @@ before(async () => {
   } else {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ses-gas-test-'));
     localBase = 'http://127.0.0.1:' + (await freePort());
+    mcpBase = 'http://127.0.0.1:' + (await freePort());
     syncSecret = 'sync-' + crypto.randomBytes(24).toString('hex');
     apiSecret = 'api-' + crypto.randomBytes(24).toString('hex');
     await startBackend();
@@ -452,4 +457,236 @@ test('showStatus reports state without revealing the secret', () => {
   assert.match(out, /historyId: \d+/);
   assert.ok(!out.includes(syncSecret));
   assert.ok(!rt.logText().includes('Please return the form'), 'message bodies must not be logged');
+});
+
+// ---------------------------------------------------------------------------
+// Attachments
+
+const HAVE_PDFTOTEXT = spawnSync('pdftotext', ['-v']).status === 0;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A one-page PDF with a line of text in a standard font. */
+function makePDF(text) {
+  const content = `BT /F1 18 Tf 72 720 Td (${text}) Tj ET`;
+  const objs = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>',
+    `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+  ];
+  let out = '%PDF-1.4\n';
+  const offsets = objs.map((o, i) => {
+    const at = out.length;
+    out += `${i + 1} 0 obj\n${o}\nendobj\n`;
+    return at;
+  });
+  const xref = out.length;
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` + offsets.map((o) => String(o).padStart(10, '0') + ' 00000 n \n').join('');
+  out += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(out, 'latin1');
+}
+
+function signedRequest(messageId, attachmentId, maxBytes, opts = {}) {
+  const ts = opts.ts || Date.now();
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const sig = crypto.createHmac('sha256', opts.secret || fetchSecret)
+    .update(['school-email-sync attachment request v1', ts, nonce, messageId, attachmentId, maxBytes].join('\n')).digest('hex');
+  return { v: 1, ts, nonce, messageId, attachmentId, maxBytes, sig };
+}
+
+function doPost(req) {
+  const out = rt.call('doPost', { postData: { contents: typeof req === 'string' ? req : JSON.stringify(req) } });
+  assert.equal(out.mimeType, 'JSON');
+  return JSON.parse(out.getContent());
+}
+
+async function mcpCall(name, args) {
+  const r = await fetch(mcpBase + '/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+  });
+  assert.equal(r.status, 200);
+  return (await r.json()).result;
+}
+
+/** Serves Code.gs doPost the way Apps Script does: POST answers 302, the result is fetched with GET. */
+function startWebApp() {
+  const results = new Map();
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://127.0.0.1');
+    if (req.method === 'POST' && u.pathname === '/exec') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        const key = crypto.randomBytes(8).toString('hex');
+        results.set(key, rt.call('doPost', { postData: { contents: body } }).getContent());
+        res.writeHead(302, { Location: '/echo?user_content_key=' + key });
+        res.end();
+      });
+    } else if (req.method === 'GET' && u.pathname === '/echo' && results.has(u.searchParams.get('user_content_key'))) {
+      const text = results.get(u.searchParams.get('user_content_key'));
+      results.delete(u.searchParams.get('user_content_key'));
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(text);
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
+}
+
+test('attachments in nested MIME parts are recorded as metadata only; inline logos are marked hidden', async () => {
+  const box = rt.mailbox;
+  const parts = [
+    {
+      partId: '0', mimeType: 'multipart/related', filename: '', headers: [], body: { size: 0 }, parts: [
+        {
+          partId: '0.0', mimeType: 'multipart/alternative', filename: '', headers: [], body: { size: 0 }, parts: [
+            box.textPart('0.0.0', 'text/plain', 'See the worksheets.'),
+            box.textPart('0.0.1', 'text/html', '<p>See the worksheets.</p><img src="cid:logo@school">'),
+          ],
+        },
+        box.attachmentPart('0.1', { filename: 'logo.png', mimeType: 'image/png', data: Buffer.from('fake png'), contentId: 'logo@school', inline: true }),
+      ],
+    },
+    box.attachmentPart('1', { filename: 'worksheet.txt', mimeType: 'text/plain', data: Buffer.from('Version A') }),
+    {
+      partId: '2', mimeType: 'multipart/mixed', filename: '', headers: [], body: { size: 0 }, parts: [
+        box.attachmentPart('2.0', { filename: 'worksheet.txt', mimeType: 'text/plain', data: Buffer.from('Version B'), form: 'bytes' }),
+        box.attachmentPart('2.1', { filename: 'tiny.csv', mimeType: 'text/csv', data: Buffer.from('a,b\n1,2\n'), inData: true }),
+      ],
+    },
+    box.attachmentPart('3', { filename: 'notes.pdf', mimeType: 'application/pdf', data: makePDF('Unit 4 vocabulary list') }),
+  ];
+  ids.mime = box.add({ subject: 'Worksheets A and B', parts, date: Date.now() - DAY });
+  const downloads = box.calls.attachmentGet;
+  rt.call('syncTick');
+  assert.equal(box.calls.attachmentGet, downloads, 'sync must not download attachment content');
+
+  const m = (await message(ids.mime)).body.message;
+  assert.equal(m.bodyText, 'See the worksheets.');
+  assert.deepEqual(m.attachments.map((a) => [a.partId, a.filename, a.hidden]), [
+    ['0.1', 'logo.png', true], ['1', 'worksheet.txt', false], ['2.0', 'worksheet.txt', false],
+    ['2.1', 'tiny.csv', false], ['3', 'notes.pdf', false],
+  ]);
+  const search = await api('GET', '/v1/messages?q=worksheets');
+  assert.equal(search.body.messages.find((x) => x.id === ids.mime).attachmentCount, 4);
+});
+
+test('doPost serves one signed attachment request and refuses forged, stale and replayed ones', () => {
+  const box = rt.mailbox;
+  rt.props.delete('ATTACHMENT_FETCH_SECRET');
+  assert.equal(doPost(signedRequest(ids.mime, '1', 1 << 20)).error.code, 'not_configured');
+  rt.props.set('ATTACHMENT_FETCH_SECRET', fetchSecret);
+
+  const req = signedRequest(ids.mime, '2.0', 1 << 20);
+  const out = doPost(req);
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(Buffer.from(out.data, 'base64').toString(), 'Version B');
+  assert.equal(out.size, 9);
+  const digest = crypto.createHash('sha256').update(out.data).digest('hex');
+  assert.equal(out.sha256, digest);
+  const expectSig = crypto.createHmac('sha256', fetchSecret)
+    .update(['school-email-sync attachment response v1', req.nonce, out.size, digest].join('\n')).digest('hex');
+  assert.equal(out.sig, expectSig);
+
+  assert.equal(doPost(req).error.code, 'replayed');
+  assert.equal(Buffer.from(doPost(signedRequest(ids.mime, '1', 1 << 20)).data, 'base64').toString(), 'Version A');
+  assert.equal(Buffer.from(doPost(signedRequest(ids.mime, '2.1', 1 << 20)).data, 'base64').toString(), 'a,b\n1,2\n');
+
+  const gets = box.calls.get;
+  assert.equal(doPost(signedRequest(ids.mime, '1', 1 << 20, { secret: 'x'.repeat(40) })).error.code, 'unauthorized');
+  const forged = signedRequest(ids.mime, '1', 1 << 20);
+  forged.attachmentId = '3';
+  assert.equal(doPost(forged).error.code, 'unauthorized');
+  assert.equal(doPost('{"v":1}').error.code, 'bad_request');
+  assert.equal(doPost('x'.repeat(5000)).error.code, 'bad_request');
+  assert.equal(box.calls.get, gets, 'Gmail must not be touched before the request is authenticated');
+  assert.equal(doPost(signedRequest(ids.mime, '1', 1 << 20, { ts: Date.now() - 10 * 60000 })).error.code, 'expired');
+
+  const downloads = box.calls.attachmentGet;
+  assert.equal(doPost(signedRequest(ids.mime, '3', 100)).error.code, 'too_large');
+  assert.equal(box.calls.attachmentGet, downloads, 'an attachment over the limit must not be downloaded');
+  assert.equal(doPost(signedRequest(ids.mime, '#9', 1 << 20)).error.code, 'not_found');
+  assert.equal(doPost(signedRequest('19aaaaaaaaaaaaaa', '1', 1 << 20)).error.code, 'not_found');
+  assert.equal(JSON.parse(rt.call('doGet').getContent()).error.code, 'method');
+  assert.ok(!rt.logText().includes('Version'), 'attachment content must not be logged');
+});
+
+test('get_attachment via the web app: backend -> signed doPost -> Gmail -> text for the agent', async (t) => {
+  if (E2E_URL) return t.skip('needs a local backend');
+  const app = await startWebApp();
+  try {
+    await stopBackend();
+    await startBackend({
+      ATTACHMENT_FETCH_URL: 'http://127.0.0.1:' + app.address().port + '/exec', ATTACHMENT_FETCH_SECRET: fetchSecret,
+    });
+    let r = await mcpCall('get_attachment', { message_id: ids.mime, attachment_id: '2.0' });
+    assert.equal(r.isError, false, JSON.stringify(r));
+    assert.equal(r.content[1].text, 'Version B');
+    assert.equal(JSON.parse(r.content[0].text).filename, 'worksheet.txt');
+    r = await mcpCall('get_attachment', { message_id: ids.mime, attachment_id: '1' });
+    assert.equal(r.content[1].text, 'Version A', 'same filename, other attachment');
+    if (HAVE_PDFTOTEXT) {
+      r = await mcpCall('get_attachment', { message_id: ids.mime, attachment_id: '3' });
+      assert.equal(JSON.parse(r.content[0].text).format, 'pdf');
+      assert.match(r.content[1].text, /Unit 4 vocabulary list/);
+    }
+    r = await mcpCall('mailbox_status', {});
+    assert.equal(JSON.parse(r.content[0].text).attachments.retrieval, 'Apps Script web app');
+    rt.props.set('ATTACHMENT_FETCH_SECRET', 'y'.repeat(40));
+    r = await mcpCall('get_attachment', { message_id: ids.mime, attachment_id: '1' });
+    assert.equal(r.isError, true);
+    assert.match(r.content[0].text, /ATTACHMENT_FETCH_SECRET/);
+  } finally {
+    rt.props.set('ATTACHMENT_FETCH_SECRET', fetchSecret);
+    await stopBackend();
+    await startBackend();
+    app.close();
+  }
+});
+
+test('get_attachment via the sync relay when no web app is deployed', async (t) => {
+  if (E2E_URL) return t.skip('needs a local backend');
+  const pending = mcpCall('get_attachment', { message_id: ids.mime, attachment_id: '2.1' });
+  await sleep(500); // the request reaches the backend before the (synchronous) trigger run
+  rt.clearLogs();
+  rt.call('syncTick');
+  const r = await pending;
+  assert.equal(r.isError, false, JSON.stringify(r));
+  assert.equal(r.content[1].text, 'a,b\n1,2');
+  assert.match(rt.logText(), /attachments sent 1/);
+  assert.ok(!rt.logText().includes('a,b'), 'attachment content must not be logged');
+});
+
+test('startAttachmentBackfill fills in metadata for stored mail from the MIME structure only', async () => {
+  const box = rt.mailbox;
+  const id = box.add({
+    subject: 'Synced before attachment metadata', text: 'see attached', date: Date.now() - 2 * DAY,
+    attachments: [{ filename: 'report.pdf', mimeType: 'application/pdf', data: makePDF('Report') }],
+  });
+  // Simulate an older sync that stored the message without its attachments.
+  const n = rt.call('normalizeMessage_', box.msgs.get(id), rt.call('readConfigLenient_'));
+  n.attachments = [];
+  const r = await fetch(localBase + '/v1/sync/message', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + syncSecret, 'Content-Type': 'application/json' }, body: JSON.stringify(n),
+  });
+  assert.equal(r.status, 200);
+  rt.call('syncTick');
+  assert.equal((await message(id)).body.message.attachments.length, 0);
+
+  const downloads = box.calls.attachmentGet;
+  box.calls.getOpts.length = 0;
+  rt.call('startAttachmentBackfill');
+  rt.clearLogs();
+  rt.call('syncTick');
+  const atts = (await message(id)).body.message.attachments;
+  assert.deepEqual(atts.map((a) => [a.partId, a.filename, a.mimeType]), [['1', 'report.pdf', 'application/pdf']]);
+  assert.equal(box.calls.attachmentGet, downloads, 'backfill must not download attachments');
+  assert.ok(box.calls.getOpts.length > 0 && box.calls.getOpts.every((o) => /body\/attachmentId/.test(o.fields || '') && !/data/.test(o.fields)),
+    'backfill reads the MIME structure only');
+  assert.match(rt.logText(), /attachment scan finished/);
+  assert.equal(JSON.parse(rt.props.get('SES_STATE')).attScan, null);
 });

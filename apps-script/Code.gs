@@ -3,24 +3,30 @@
  *
  * Runs under the school Google account. Every minute (installTrigger) it:
  *   1. reports any outbound-action results that could not be delivered earlier,
- *   2. polls the Linux backend for pending send/reply actions and performs them,
+ *   2. polls the Linux backend for pending send/reply actions (and, in relay mode,
+ *      attachment downloads) and performs them,
  *   3. reads Gmail changes since the last run (Gmail history API) and pushes new
  *      messages and label/read-state changes to the backend in bounded batches.
+ * Deployed as a web app, doPost also downloads single attachments on demand for
+ * the backend (signed requests; see "Attachments" below).
  *
  * Google credentials never leave Apps Script. The backend only sees normalized
- * message JSON over HTTPS, authenticated with SYNC_SECRET.
+ * message JSON over HTTPS, authenticated with SYNC_SECRET, plus the one attachment
+ * an agent asked for.
  *
  * Script Properties (Project Settings → Script Properties):
- *   BACKEND_URL   https://<your hostname>        (required, https only)
- *   SYNC_SECRET   shared secret from the server  (required)
+ *   BACKEND_URL              https://<your hostname>        (required, https only)
+ *   SYNC_SECRET              shared secret from the server  (required)
+ *   ATTACHMENT_FETCH_SECRET  shared secret for the web app  (only with a web app deployment)
  * Optional overrides use the names in DEFAULTS below (e.g. INITIAL_SYNC_DAYS).
  *
  * Manual helpers (select in the editor's function menu, then Run):
  *   testGmailRead, testGmailSend, testBackendConnectivity, runFullSyncNow,
- *   installTrigger, removeTrigger, showStatus, startBackfill, resetSyncState
+ *   installTrigger, removeTrigger, showStatus, startBackfill, startAttachmentBackfill,
+ *   resetSyncState
  */
 
-var VERSION = '1.0.0';
+var VERSION = '1.1.0';
 
 var DEFAULTS = {
   RUN_BUDGET_MS: 45000,          // trigger runs stop starting new work after this
@@ -50,6 +56,15 @@ var PROP = {
 var DAY_MS = 86400000;
 var JOURNAL_MAX_AGE_MS = 14 * DAY_MS;
 var ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+var ATTACHMENT_KEY_RE = /^(#\d{1,3}|[0-9A-Za-z.]{1,64})$/; // MIME part ID, or "#<position>"
+
+// Gmail partial response with the MIME tree only: no bodies, no attachment data.
+var MIME_PART_FIELDS = 'partId,mimeType,filename,headers,body/attachmentId,body/size';
+var MIME_FIELDS = 'id,payload(' + nestedPartFields_(12) + ')';
+
+function nestedPartFields_(depth) {
+  return depth ? MIME_PART_FIELDS + ',parts(' + nestedPartFields_(depth - 1) + ')' : MIME_PART_FIELDS;
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -69,6 +84,11 @@ class BackendRejectedError extends Error {
 
 class ConfigError extends Error {
   constructor(message) { super(message); this.name = 'ConfigError'; }
+}
+
+/** An attachment download problem, reported to the backend by code. */
+class AttachmentError extends Error {
+  constructor(code, message) { super(message); this.name = 'AttachmentError'; this.code = code; }
 }
 
 function errMsg_(e) {
@@ -135,7 +155,7 @@ function newRun_(manual) {
     savedQueue: all[PROP.QUEUE] || '',
     stats: {
       historyChanges: 0, stateUpdated: 0, fetched: 0, inserted: 0, updated: 0, unchanged: 0,
-      rejected: 0, skipped: 0, actionsDone: 0, actionsFailed: 0
+      rejected: 0, skipped: 0, actionsDone: 0, actionsFailed: 0, attachmentsSent: 0, attachmentMeta: 0
     }
   };
 }
@@ -276,7 +296,7 @@ function backoff_(run, fixedMs) {
 function logSummary_(run, force) {
   var s = run.stats;
   var busy = s.historyChanges || s.inserted || s.updated || s.stateUpdated || s.rejected ||
-    s.actionsDone || s.actionsFailed || run.queue.length || run.state.sweep;
+    s.actionsDone || s.actionsFailed || s.attachmentsSent || run.queue.length || run.state.sweep || run.state.attScan;
   if (!busy && !force) return;
   var parts = [
     'new ' + s.inserted,
@@ -287,8 +307,11 @@ function logSummary_(run, force) {
   if (s.skipped) parts.push('skipped ' + s.skipped);
   if (s.rejected) parts.push('rejected ' + s.rejected);
   if (s.actionsDone || s.actionsFailed) parts.push('actions ok ' + s.actionsDone + ' failed ' + s.actionsFailed);
+  if (s.attachmentsSent) parts.push('attachments sent ' + s.attachmentsSent);
   if (run.queue.length) parts.push('queued ' + run.queue.length);
   if (run.state.sweep) parts.push(run.state.sweep.kind + ' scan in progress (' + run.state.sweep.scanned + ' checked)');
+  if (run.state.attScan) parts.push('attachment scan in progress (' + run.state.attScan.scanned + ' checked, ' +
+    run.state.attScan.updated + ' updated)');
   console.log('sync: ' + parts.join(', ') + ' [' + ((Date.now() - run.start) / 1000).toFixed(1) + 's]');
 }
 
@@ -313,6 +336,9 @@ function processActions_(run) {
     }
     executeAction_(run, actions[i]);
   }
+  (resp.attachmentRequests || []).forEach(function (r) {
+    if (timeLeft_(run) > 15000) relayAttachment_(run, r);
+  });
 }
 
 function journalKey_(id) {
@@ -488,6 +514,7 @@ function syncMail_(run) {
     sweepPage_(run);
     drainQueue_(run);
   }
+  if (!run.state.sweep) attachmentScanStep_(run);
   run.state.lastOkAt = Date.now();
   persist_(run);
 }
@@ -738,7 +765,7 @@ function normalizeMessage_(msg, cfg) {
   };
   var texts = [];
   var htmls = [];
-  walkParts_(msg.id, payload, texts, htmls, out.attachments, 0);
+  out.attachments = attachmentParts_(msg, texts, htmls).map(function (x) { return x.meta; });
   if (texts.length) {
     var t = clip_(texts.join('\n'), cfg.MAX_TEXT_CHARS);
     out.bodyText = t.text;
@@ -749,13 +776,23 @@ function normalizeMessage_(msg, cfg) {
     out.bodyHtml = x.text;
     out.bodyHtmlTruncated = x.truncated;
   }
-  var seenParts = {};
-  out.attachments = out.attachments.slice(0, 100).map(function (a) {
-    if (a.partId && seenParts[a.partId]) a.partId = ''; // backend keys these by position instead
-    seenParts[a.partId] = true;
-    return a;
-  });
   return out;
+}
+
+/**
+ * The message's attachment parts in MIME order, as {meta, part}. meta is the
+ * metadata sent to the backend; its partId (or "#<position>" when empty) is the
+ * attachment's stable ID. With texts/htmls, also collects the readable body.
+ */
+function attachmentParts_(msg, texts, htmls) {
+  var found = [];
+  walkParts_(msg.id, msg.payload || {}, texts, htmls, found, 0);
+  var seen = {};
+  return found.slice(0, 100).map(function (x) {
+    if (x.meta.partId && seen[x.meta.partId]) x.meta.partId = ''; // backend keys these by position instead
+    seen[x.meta.partId] = true;
+    return x;
+  });
 }
 
 function walkParts_(msgId, part, texts, htmls, atts, depth) {
@@ -772,19 +809,23 @@ function walkParts_(msgId, part, texts, htmls, atts, depth) {
   }
   var isText = mime === 'text/plain' || mime === 'text/html';
   if (filename || disposition.indexOf('attachment') === 0 || (body.attachmentId && !isText)) {
-    // Metadata only. The attachment content stays in Gmail.
+    // Metadata only. The attachment content stays in Gmail until someone asks for it.
     atts.push({
-      partId: String(part.partId || '').replace(/[^0-9A-Za-z.]/g, '').slice(0, 64),
-      filename: filename.slice(0, 500),
-      mimeType: mime.slice(0, 200),
-      size: Number(body.size || 0),
-      attachmentId: String(body.attachmentId || '').slice(0, 4000),
-      contentId: (ph['content-id'] || '').replace(/[<>\s]/g, '').slice(0, 900),
-      inline: disposition.indexOf('inline') === 0
+      part: part,
+      meta: {
+        partId: String(part.partId || '').replace(/[^0-9A-Za-z.]/g, '').slice(0, 64),
+        filename: filename.slice(0, 500),
+        mimeType: mime.slice(0, 200),
+        size: Number(body.size || 0),
+        attachmentId: String(body.attachmentId || '').slice(0, 4000),
+        contentId: (ph['content-id'] || '').replace(/[<>\s]/g, '').slice(0, 900),
+        inline: disposition.indexOf('inline') === 0
+      }
     });
     return;
   }
   if (isText) {
+    if (!texts) return; // metadata only
     try {
       var s = decodePartBody_(msgId, part, charsetOf_(ph['content-type']));
       if (s) (mime === 'text/plain' ? texts : htmls).push(s);
@@ -828,6 +869,228 @@ function bytesToString_(data, charset) {
     return Utilities.newBlob(bytes).getDataAsString(charset);
   } catch (e) {
     return Utilities.newBlob(bytes).getDataAsString('UTF-8');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Attachments
+//
+// The backend stores attachment metadata only. When an agent wants a file, the
+// backend asks for that one attachment and discards it after converting it. Two
+// ways in:
+//   * Web app (fast): the backend POSTs a signed request to this script's /exec
+//     URL (doPost). HMAC-SHA256 with ATTACHMENT_FETCH_SECRET over timestamp,
+//     nonce, message, attachment and size limit; requests older than 2 minutes or
+//     seen before are refused; the response is signed back. Needs a web app
+//     deployment (Execute as: Me, Who has access: Anyone).
+//   * Relay (no deployment): requests arrive with the action poll and the file is
+//     uploaded to the backend over the SYNC_SECRET channel.
+
+var ATTACHMENT_WINDOW_MS = 120000;
+var ATTACHMENT_MAX_BYTES = 26214400; // Gmail's own limit (25 MB)
+
+/** Web app entry point: one signed attachment request from the backend. */
+function doPost(e) {
+  var out;
+  try {
+    out = serveAttachmentRequest_(String((e && e.postData && e.postData.contents) || ''));
+  } catch (err) {
+    out = { ok: false, error: attachmentErrorInfo_(err) };
+  }
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/** Opening the /exec URL in a browser shows this; useful to check the deployment's access setting. */
+function doGet() {
+  var out = { ok: false, error: { code: 'method', message: 'School Email Sync attachment endpoint ' + VERSION + ': POST only' } };
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function attachmentErrorInfo_(err) {
+  if (err instanceof AttachmentError) return { code: err.code, message: err.message };
+  if (isNotFound_(err)) return { code: 'not_found', message: 'Gmail has no such message or attachment' };
+  var transient = isTransientGmailError_(err);
+  if (!transient) console.warn('attachments: ' + errMsg_(err));
+  return { code: transient ? 'unavailable' : 'failed', message: errMsg_(err).slice(0, 300) };
+}
+
+function serveAttachmentRequest_(raw) {
+  var secret = String(PropertiesService.getScriptProperties().getProperty('ATTACHMENT_FETCH_SECRET') || '').trim();
+  if (secret.length < 32) {
+    throw new AttachmentError('not_configured', 'Script Property ATTACHMENT_FETCH_SECRET is missing or shorter than 32 characters');
+  }
+  var req = raw.length <= 4096 ? parseJSON_(raw, null) : null;
+  if (!req || req.v !== 1) throw new AttachmentError('bad_request', 'invalid request');
+  var ts = Number(req.ts);
+  var nonce = String(req.nonce || '');
+  var id = String(req.messageId || '');
+  var key = String(req.attachmentId || '');
+  var maxBytes = Number(req.maxBytes);
+  if (!isFinite(ts) || !/^[0-9a-f]{32}$/.test(nonce) || !ID_RE.test(id) || !ATTACHMENT_KEY_RE.test(key) ||
+    !(maxBytes > 0 && maxBytes <= ATTACHMENT_MAX_BYTES && Math.floor(maxBytes) === maxBytes)) {
+    throw new AttachmentError('bad_request', 'invalid request');
+  }
+  // Authenticate before anything else; Gmail is only touched for valid requests.
+  var expected = hmacHex_(secret, ['school-email-sync attachment request v1', ts, nonce, id, key, maxBytes].join('\n'));
+  if (!safeEqual_(expected, String(req.sig || ''))) throw new AttachmentError('unauthorized', 'invalid signature');
+  if (Math.abs(Date.now() - ts) > ATTACHMENT_WINDOW_MS) {
+    throw new AttachmentError('expired', 'request timestamp is more than 2 minutes off');
+  }
+  var cache = CacheService.getScriptCache();
+  if (cache.get('ses_nonce_' + nonce)) throw new AttachmentError('replayed', 'request was already used');
+  cache.put('ses_nonce_' + nonce, '1', 600); // outlives the 2-minute window
+
+  var att = downloadAttachment_(id, key, maxBytes);
+  var digest = sha256Hex_(att.data);
+  att.ok = true;
+  att.v = 1;
+  att.nonce = nonce;
+  att.sha256 = digest;
+  att.sig = hmacHex_(secret, ['school-email-sync attachment response v1', nonce, att.size, digest].join('\n'));
+  return att;
+}
+
+/** Downloads one attachment (by part ID or "#<position>") as standard base64. */
+function downloadAttachment_(messageId, key, maxBytes) {
+  if (!ID_RE.test(String(messageId)) || !ATTACHMENT_KEY_RE.test(String(key)) || !(maxBytes > 0)) {
+    throw new AttachmentError('bad_request', 'invalid attachment request');
+  }
+  var found = findAttachmentPart_(getMimeStructure_(messageId), key);
+  if (!found) throw new AttachmentError('not_found', 'message ' + messageId + ' has no attachment ' + key);
+  var body = found.part.body || {};
+  if (Number(body.size || 0) > maxBytes) {
+    throw new AttachmentError('too_large', 'attachment is ' + body.size + ' bytes; the limit is ' + maxBytes);
+  }
+  var data;
+  if (body.attachmentId) {
+    data = Gmail.Users.Messages.Attachments.get('me', messageId, body.attachmentId).data;
+  } else {
+    // Small parts can be stored inside the message itself.
+    var inMessage = findAttachmentPart_(Gmail.Users.Messages.get('me', messageId, { format: 'full' }), key);
+    data = inMessage && inMessage.part.body && inMessage.part.body.data;
+  }
+  var b64 = toBase64_(data || '');
+  var size = base64Bytes_(b64);
+  if (size > maxBytes) throw new AttachmentError('too_large', 'attachment is ' + size + ' bytes; the limit is ' + maxBytes);
+  return { filename: found.meta.filename, mimeType: found.meta.mimeType, size: size, data: b64 };
+}
+
+function findAttachmentPart_(msg, key) {
+  var list = attachmentParts_(msg, null, null);
+  for (var i = 0; i < list.length; i++) {
+    if ((list[i].meta.partId || '#' + i) === key) return list[i];
+  }
+  return null;
+}
+
+/** MIME structure of a message without bodies or attachment data. */
+function getMimeStructure_(id) {
+  try {
+    return Gmail.Users.Messages.get('me', id, { format: 'full', fields: MIME_FIELDS });
+  } catch (e) {
+    if (!/field/i.test(errMsg_(e)) || isNotFound_(e)) throw e;
+    return Gmail.Users.Messages.get('me', id, { format: 'full' }); // partial responses refused: read it all
+  }
+}
+
+/** Gmail returns attachment data as a byte array or URL-safe base64; this gives standard base64. */
+function toBase64_(data) {
+  if (typeof data !== 'string') return Utilities.base64Encode(data);
+  var b64 = data.replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
+  while (b64.length % 4) b64 += '=';
+  return b64;
+}
+
+function base64Bytes_(b64) {
+  var pad = b64.slice(-2) === '==' ? 2 : (b64.slice(-1) === '=' ? 1 : 0);
+  return b64.length / 4 * 3 - pad;
+}
+
+function bytesHex_(bytes) {
+  return bytes.map(function (b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('');
+}
+
+function hmacHex_(key, value) {
+  return bytesHex_(Utilities.computeHmacSha256Signature(value, key, Utilities.Charset.UTF_8));
+}
+
+function sha256Hex_(value) {
+  return bytesHex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, value, Utilities.Charset.UTF_8));
+}
+
+/** Compares two strings in time independent of where they differ. */
+function safeEqual_(a, b) {
+  if (a.length !== b.length) return false;
+  var diff = 0;
+  for (var i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** Relay mode: downloads a requested attachment and uploads it to the backend. */
+function relayAttachment_(run, r) {
+  var body;
+  try {
+    body = downloadAttachment_(String(r.messageId || ''), String(r.attachmentId || ''), Math.min(Number(r.maxBytes) || 0, ATTACHMENT_MAX_BYTES));
+    body.ok = true;
+  } catch (e) {
+    body = { ok: false, error: attachmentErrorInfo_(e) }; // the agent waiting for it gets the reason
+  }
+  try {
+    api_(run, 'post', '/v1/attachments/relay/' + encodeURIComponent(String(r.id || '')), body);
+    if (body.ok) run.stats.attachmentsSent++;
+  } catch (e) {
+    // 404/410: nobody waits for it any more, and the backend has already dropped it.
+    if (!(e instanceof BackendRejectedError && (e.status === 404 || e.status === 410))) throw e;
+  }
+}
+
+/**
+ * One slice of startAttachmentBackfill: lists messages with attachments, keeps the
+ * ones the backend stores, reads their MIME structure (no bodies, no attachment
+ * data) and sends the attachment metadata.
+ */
+function attachmentScanStep_(run) {
+  var sc = run.state.attScan;
+  while (sc && timeLeft_(run) > 15000 && run.stats.fetched < run.fetchCap) {
+    if (!sc.ids.length) {
+      if (sc.listed && !sc.pageToken) {
+        console.log('sync: attachment scan finished (' + sc.scanned + ' messages checked, ' + sc.updated + ' updated)');
+        run.state.attScan = sc = null;
+        break;
+      }
+      var opts = { q: sc.q, maxResults: 100, includeSpamTrash: false };
+      if (sc.pageToken) opts.pageToken = sc.pageToken;
+      var resp = Gmail.Users.Messages.list('me', opts);
+      var ids = (resp.messages || []).map(function (m) { return m.id; }).filter(function (id) { return ID_RE.test(id); });
+      if (ids.length) {
+        var unknown = {};
+        (api_(run, 'post', '/v1/sync/known', { ids: ids }).unknown || []).forEach(function (id) { unknown[id] = true; });
+        sc.ids = ids.filter(function (id) { return !unknown[id]; });
+      }
+      sc.scanned += ids.length;
+      sc.pageToken = resp.nextPageToken || '';
+      sc.listed = true;
+      persist_(run);
+      continue;
+    }
+    var batch = [];
+    var n = 0;
+    for (; n < sc.ids.length && batch.length < 20 && timeLeft_(run) > 12000 && run.stats.fetched < run.fetchCap; n++) {
+      try {
+        var msg = getMimeStructure_(sc.ids[n]);
+        run.stats.fetched++;
+        batch.push({ id: sc.ids[n], attachments: attachmentParts_(msg, null, null).map(function (x) { return x.meta; }) });
+      } catch (e) {
+        if (isTransientGmailError_(e)) throw e; // deleted meanwhile otherwise: skip it
+      }
+    }
+    if (batch.length) {
+      var res = api_(run, 'post', '/v1/sync/attachments', { messages: batch });
+      sc.updated += res.updated || 0;
+      run.stats.attachmentMeta += res.updated || 0;
+    }
+    sc.ids = sc.ids.slice(n); // only after the upload succeeded
+    persist_(run);
   }
 }
 
@@ -927,6 +1190,8 @@ function showStatus() {
     'historyId: ' + (st.historyId || '(not started)'),
     'last successful run: ' + (st.lastOkAt ? new Date(st.lastOkAt).toISOString() : 'never'),
     'scan: ' + (st.sweep ? st.sweep.kind + ', ' + st.sweep.scanned + ' checked' : 'none'),
+    'attachment scan: ' + (st.attScan ? st.attScan.scanned + ' checked, ' + st.attScan.updated + ' updated' : 'none'),
+    'ATTACHMENT_FETCH_SECRET ' + (all.ATTACHMENT_FETCH_SECRET ? 'set' : '(not set: web app disabled, relay only)'),
     'queued messages: ' + queue.length,
     'unreported actions: ' + journal.length,
     'backoff: ' + (backoff && backoff.until > Date.now() ? 'until ' + new Date(backoff.until).toISOString() : 'none')
@@ -943,6 +1208,26 @@ function startBackfill() {
     run.state.sweep = newSweep_(run.cfg.BACKFILL_DAYS, 'backfill');
     persist_(run);
     console.log('Backfill of the last ' + run.cfg.BACKFILL_DAYS + ' days scheduled; it continues with each trigger run.');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Refreshes the attachment metadata (names, types, sizes, part IDs) of mail the
+ * backend already stores, going back BACKFILL_DAYS (default 365), over the next
+ * trigger runs. Reads only the MIME structure: no attachment content, no bodies.
+ */
+function startAttachmentBackfill() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('A sync run is in progress; try again in a minute.');
+  try {
+    var run = newRun_(true);
+    if (!run.state.historyId) throw new Error('Run runFullSyncNow or install the trigger first.');
+    var after = Math.floor((Date.now() - run.cfg.BACKFILL_DAYS * DAY_MS) / 1000);
+    run.state.attScan = { q: 'has:attachment after:' + after + ' -in:drafts -in:chats', pageToken: '', listed: false, ids: [], scanned: 0, updated: 0 };
+    persist_(run);
+    console.log('Attachment metadata backfill of the last ' + run.cfg.BACKFILL_DAYS + ' days scheduled; it continues with each trigger run.');
   } finally {
     lock.releaseLock();
   }

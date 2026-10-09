@@ -98,7 +98,7 @@ func (s *Store) Backup(ctx context.Context, dest string) error {
 }
 
 // migrations[i] upgrades the schema from user_version i to i+1.
-var migrations = []string{schemaV1}
+var migrations = []string{schemaV1, schemaV2}
 
 func (s *Store) migrate(ctx context.Context) error {
 	var v int
@@ -171,9 +171,8 @@ CREATE INDEX messages_by_date   ON messages(internal_date DESC, gmail_id DESC);
 CREATE INDEX messages_by_thread ON messages(thread_id, internal_date);
 CREATE INDEX messages_unread    ON messages(internal_date DESC) WHERE is_unread = 1;
 
--- Metadata only. Content is not downloaded; the fetch_* columns reserve space for
--- on-demand fetching later. Gmail attachment IDs can change between API reads, so
--- (gmail_id, part_id) is the stable key and attachment_id is refreshed on refetch.
+-- Metadata only. Gmail attachment IDs can change between API reads, so
+-- (gmail_id, part_id) is the stable key. (The fetch_* columns are dropped in v2.)
 CREATE TABLE attachments (
   id                  INTEGER PRIMARY KEY,
   gmail_id            TEXT NOT NULL REFERENCES messages(gmail_id) ON DELETE CASCADE,
@@ -246,6 +245,33 @@ CREATE TABLE kv (
   updated_at INTEGER NOT NULL
 );
 `
+
+// schemaV2: attachment content is fetched from Gmail on demand and never stored,
+// so the columns reserved for stored copies go. hidden marks parts that belong to
+// the message body (signature logos and other inline images, signature parts).
+const schemaV2 = `
+ALTER TABLE attachments DROP COLUMN fetch_state;
+ALTER TABLE attachments DROP COLUMN stored_path;
+ALTER TABLE attachments DROP COLUMN sha256;
+ALTER TABLE attachments DROP COLUMN fetched_at;
+ALTER TABLE attachments ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+UPDATE attachments SET hidden = ` + attachmentHiddenSQL + `;
+`
+
+// attachmentHiddenSQL decides whether an attachments row is part of the message
+// body rather than a file the sender attached: an image with a Content-ID that the
+// HTML shows inline (cid: reference or inline disposition), which is how signature
+// logos are sent, or an S/MIME or PGP signature. Hidden parts are left out of
+// attachment lists, counts and has:attachment, as in Gmail. Non-image parts are
+// always real attachments, even with an inline disposition (Apple Mail sends PDFs
+// that way).
+const attachmentHiddenSQL = `CASE
+  WHEN mime_type IN ('application/pkcs7-signature', 'application/x-pkcs7-signature', 'application/pgp-signature') THEN 1
+  WHEN mime_type NOT LIKE 'image/%' OR content_id = '' THEN 0
+  WHEN is_inline = 1 THEN 1
+  WHEN instr(lower(coalesce((SELECT body_html FROM messages m WHERE m.gmail_id = attachments.gmail_id), '')),
+             'cid:' || lower(content_id)) > 0 THEN 1
+  ELSE 0 END`
 
 func (s *Store) setKV(ctx context.Context, key, value string, now int64) error {
 	_, err := s.db.ExecContext(ctx,

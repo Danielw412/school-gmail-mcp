@@ -7,6 +7,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,6 +31,29 @@ type Config struct {
 	ActionLease       time.Duration
 	ActionMaxAttempts int
 	LogLevel          slog.Level
+
+	// MCPListenAddr is the loopback address of the MCP endpoint for ChatGPT, reached
+	// only through the OpenAI Secure MCP Tunnel (never routed by Cloudflare). Empty
+	// disables it.
+	MCPListenAddr string
+	// MCPSendDelay holds email queued through MCP before Apps Script may send it,
+	// so a request can still be cancelled ("undo send").
+	MCPSendDelay time.Duration
+	// MCPAllowSend exposes the send/reply tools. When false, MCP is read-only.
+	MCPAllowSend bool
+
+	// AttachmentFetchURL is the Apps Script web app (/exec URL) that downloads one
+	// attachment from Gmail when an agent asks for it. Requests are signed with
+	// AttachmentFetchSecret. Empty: requests ride on the Apps Script action poll
+	// instead (no web app needed, but up to about a minute slower).
+	AttachmentFetchURL    string
+	AttachmentFetchSecret string
+	// AttachmentMaxBytes is the largest attachment that is downloaded and converted.
+	AttachmentMaxBytes int64
+	// AttachmentFetchTimeout bounds the download from Gmail (or the wait for the
+	// poll); AttachmentConvertTimeout bounds text extraction and image conversion.
+	AttachmentFetchTimeout   time.Duration
+	AttachmentConvertTimeout time.Duration
 }
 
 const minSecretLen = 32
@@ -40,6 +64,13 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		ActionLease:       10 * time.Minute,
 		ActionMaxAttempts: 5,
 		LogLevel:          slog.LevelInfo,
+		MCPListenAddr:     "127.0.0.1:8767",
+		MCPSendDelay:      60 * time.Second,
+		MCPAllowSend:      true,
+
+		AttachmentMaxBytes:       10 << 20,
+		AttachmentFetchTimeout:   40 * time.Second,
+		AttachmentConvertTimeout: 15 * time.Second,
 	}
 	if v := strings.TrimSpace(getenv("LISTEN_ADDR")); v != "" {
 		c.ListenAddr = v
@@ -91,7 +122,82 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			return c, fmt.Errorf("LOG_LEVEL: %w", err)
 		}
 	}
+
+	if v := strings.TrimSpace(getenv("MCP_LISTEN_ADDR")); v != "" {
+		c.MCPListenAddr = v
+		if strings.EqualFold(v, "off") {
+			c.MCPListenAddr = ""
+		}
+	}
+	if c.MCPListenAddr != "" {
+		if err := requireLoopback(c.MCPListenAddr); err != nil {
+			return c, fmt.Errorf("MCP_LISTEN_ADDR: %w", err)
+		}
+		if c.MCPListenAddr == c.ListenAddr {
+			return c, errors.New("MCP_LISTEN_ADDR must differ from LISTEN_ADDR (only LISTEN_ADDR is published through Cloudflare)")
+		}
+	}
+	if v := strings.TrimSpace(getenv("MCP_SEND_DELAY_SECONDS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 900 {
+			return c, errors.New("MCP_SEND_DELAY_SECONDS must be an integer between 0 and 900")
+		}
+		c.MCPSendDelay = time.Duration(n) * time.Second
+	}
+	if v := strings.TrimSpace(getenv("MCP_ALLOW_SEND")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return c, fmt.Errorf("MCP_ALLOW_SEND: %w", err)
+		}
+		c.MCPAllowSend = b
+	}
+
+	if v := strings.TrimSpace(getenv("ATTACHMENT_FETCH_URL")); v != "" {
+		if err := checkFetchURL(v); err != nil {
+			return c, err
+		}
+		c.AttachmentFetchURL = v
+		c.AttachmentFetchSecret = strings.TrimSpace(getenv("ATTACHMENT_FETCH_SECRET"))
+		if len(c.AttachmentFetchSecret) < minSecretLen {
+			return c, fmt.Errorf("ATTACHMENT_FETCH_SECRET must be set and at least %d characters when ATTACHMENT_FETCH_URL is set", minSecretLen)
+		}
+		if c.AttachmentFetchSecret == c.SyncSecret || c.AttachmentFetchSecret == c.APISecret {
+			return c, errors.New("ATTACHMENT_FETCH_SECRET must differ from SYNC_SECRET and API_SECRET")
+		}
+	}
+	if v := strings.TrimSpace(getenv("ATTACHMENT_MAX_BYTES")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 1<<10 || n > 25<<20 {
+			return c, errors.New("ATTACHMENT_MAX_BYTES must be an integer between 1024 and 26214400 (25 MiB, Gmail's limit)")
+		}
+		c.AttachmentMaxBytes = n
+	}
+	for name, dst := range map[string]*time.Duration{
+		"ATTACHMENT_FETCH_TIMEOUT_SECONDS": &c.AttachmentFetchTimeout, "ATTACHMENT_CONVERT_TIMEOUT_SECONDS": &c.AttachmentConvertTimeout,
+	} {
+		if v := strings.TrimSpace(getenv(name)); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 5 || n > 300 {
+				return c, fmt.Errorf("%s must be an integer between 5 and 300", name)
+			}
+			*dst = time.Duration(n) * time.Second
+		}
+	}
 	return c, nil
+}
+
+// checkFetchURL accepts an Apps Script web app URL (https://script.google.com/.../exec)
+// or, for tests, plain HTTP on loopback.
+func checkFetchURL(v string) error {
+	u, err := url.Parse(v)
+	switch {
+	case err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "":
+	case u.Scheme == "https" && u.Host == "script.google.com" && strings.HasSuffix(u.Path, "/exec"):
+		return nil
+	case u.Scheme == "http" && isLoopbackHost(u.Host):
+		return nil
+	}
+	return errors.New("ATTACHMENT_FETCH_URL must be the web app URL https://script.google.com/macros/s/<id>/exec (Deploy -> Manage deployments in Apps Script)")
 }
 
 // defaultDBPath resolves DB_PATH, then systemd's $STATE_DIRECTORY, then (for the
