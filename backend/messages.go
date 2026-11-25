@@ -635,6 +635,14 @@ type SearchParams struct {
 	CursorTS   int64
 	CursorID   string
 	WithTrash  bool
+
+	// Exclusions (-term in a query).
+	NotFTS        string // FTS5 query; emails matching it are left out
+	NotFrom       []string
+	NotTo         []string // matches neither To nor Cc
+	NotSubject    []string
+	NotLabels     []string // label IDs or display names
+	NotAttachName []string
 }
 
 type MessageSummary struct {
@@ -712,12 +720,37 @@ func (s *Store) Search(ctx context.Context, p SearchParams) ([]MessageSummary, s
 		where = append(where, `m.subject LIKE ? ESCAPE '\'`)
 		args = append(args, likeArg(p.Subject))
 	}
-	if p.Label != "" {
-		// Gmail writes spaces in label names as hyphens (label:robotics-club).
-		where = append(where, `EXISTS (SELECT 1 FROM json_each(m.label_ids) j WHERE j.value = ?
+	// Gmail writes spaces in label names as hyphens (label:robotics-club).
+	const hasLabel = `EXISTS (SELECT 1 FROM json_each(m.label_ids) j WHERE j.value = ?
 			OR j.value IN (SELECT label_id FROM labels WHERE name = ? COLLATE NOCASE
-			OR replace(name, ' ', '-') = ? COLLATE NOCASE))`)
+			OR replace(name, ' ', '-') = ? COLLATE NOCASE))`
+	if p.Label != "" {
+		where = append(where, hasLabel)
 		args = append(args, p.Label, p.Label, p.Label)
+	}
+	for _, l := range p.NotLabels {
+		where = append(where, "NOT "+hasLabel)
+		args = append(args, l, l, l)
+	}
+	if p.NotFTS != "" {
+		where = append(where, `m.rowid NOT IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)`)
+		args = append(args, p.NotFTS)
+	}
+	for _, v := range p.NotFrom {
+		where = append(where, `m.from_addr NOT LIKE ? ESCAPE '\'`)
+		args = append(args, likeArg(v))
+	}
+	for _, v := range p.NotTo {
+		where = append(where, `NOT (m.to_addrs LIKE ? ESCAPE '\' OR m.cc_addrs LIKE ? ESCAPE '\')`)
+		args = append(args, likeArg(v), likeArg(v))
+	}
+	for _, v := range p.NotSubject {
+		where = append(where, `m.subject NOT LIKE ? ESCAPE '\'`)
+		args = append(args, likeArg(v))
+	}
+	for _, v := range p.NotAttachName {
+		where = append(where, `NOT EXISTS (SELECT 1 FROM attachments a WHERE a.gmail_id = m.gmail_id AND a.filename LIKE ? ESCAPE '\')`)
+		args = append(args, likeArg(v))
 	}
 	if p.ThreadID != "" {
 		where = append(where, `m.thread_id = ?`)

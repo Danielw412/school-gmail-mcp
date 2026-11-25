@@ -159,7 +159,7 @@ func TestMCPHandshakeAndToolList(t *testing.T) {
 		}
 	}
 	for _, name := range []string{"search", "fetch", "search_emails", "get_email", "get_thread", "mailbox_status",
-		"list_outgoing", "send_email", "reply_to_email", "cancel_email"} {
+		"list_outgoing", "send_email", "reply_to_email", "create_draft", "cancel_email"} {
 		if byName[name] == nil {
 			t.Errorf("missing tool %s", name)
 		}
@@ -242,9 +242,17 @@ func TestMCPReadTools(t *testing.T) {
 	if num(out["count"]) != 1 {
 		t.Fatalf("in:sent: %v", out)
 	}
-	out, _, _ = e.call("search_emails", map[string]any{"query": "robotics -spam"})
-	if len(list(out["ignored_terms"])) != 1 {
-		t.Fatalf("negation should be reported as ignored: %v", out)
+	out, _, _ = e.call("search_emails", map[string]any{"query": "robotics -thursday"})
+	if out["ignored_terms"] != nil || num(out["count"]) != 1 || str(obj(list(out["emails"])[0])["id"]) != "s3" {
+		t.Fatalf("a word exclusion should leave out s1: %v", out)
+	}
+	out, _, _ = e.call("search_emails", map[string]any{"query": "-from:lee -label:robotics-club -is:unread"})
+	if num(out["count"]) != 1 || str(obj(list(out["emails"])[0])["id"]) != "s3" {
+		t.Fatalf("operator exclusions: %v", out)
+	}
+	out, _, _ = e.call("search_emails", map[string]any{"query": "-in:inbox"})
+	if num(out["count"]) != 1 || str(obj(list(out["emails"])[0])["id"]) != "s3" {
+		t.Fatalf("-in:inbox: %v", out)
 	}
 	out, _, _ = e.call("search_emails", map[string]any{"limit": 2})
 	if num(out["count"]) != 2 || str(out["next_cursor"]) == "" {
@@ -362,10 +370,75 @@ func TestMCPSendReplyCancel(t *testing.T) {
 	}
 }
 
+func TestMCPCreateDraft(t *testing.T) {
+	e := newMCPEnv(t, true)
+	e.seed()
+	ctx := context.Background()
+
+	out, isErr, text := e.call("create_draft", map[string]any{
+		"to": "rivera@school.example.org", "subject": "Homework question", "body": "Hi Ms. Rivera,\nCould you explain #3?",
+	})
+	if isErr || str(out["type"]) != "draft" || str(out["status"]) != "pending" || out["send_after"] != nil ||
+		!strings.Contains(str(out["note"]), "Drafts folder") || !strings.Contains(str(out["status_meaning"]), "draft") {
+		t.Fatalf("create_draft: %s", text)
+	}
+	draftID := str(out["action_id"])
+
+	out, isErr, text = e.call("create_draft", map[string]any{"body": "Notes to finish later"})
+	if isErr {
+		t.Fatalf("draft without recipients or subject: %s", text)
+	}
+	blankID := str(out["action_id"])
+
+	out, isErr, text = e.call("create_draft", map[string]any{"reply_to_message_id": "s1", "body": "I'll be there.", "reply_all": true})
+	if isErr || str(out["type"]) != "draft_reply" || str(out["reply_to_message_id"]) != "s1" ||
+		str(obj(out["in_reply_to"])["subject"]) != "Robotics meeting moved" {
+		t.Fatalf("draft reply: %s", text)
+	}
+
+	for _, bad := range []map[string]any{
+		{"reply_to_message_id": "s1", "subject": "x", "body": "y"},
+		{"reply_to_message_id": "missing", "body": "y"},
+		{"reply_all": true, "body": "y"},
+		{"to": []string{"not an address"}, "body": "y"},
+		{"subject": "only a subject"},
+	} {
+		if _, isErr, text := e.call("create_draft", bad); !isErr {
+			t.Errorf("create_draft %v should fail: %s", bad, text)
+		}
+	}
+
+	// Repeating the request does not create a second draft.
+	out, _, _ = e.call("create_draft", map[string]any{"body": "Notes to finish later"})
+	if str(out["action_id"]) != blankID || !strings.Contains(str(out["note"]), "not created again") {
+		t.Fatalf("duplicate draft: %v", out)
+	}
+
+	// Drafts skip the send delay: Apps Script can claim them immediately.
+	got, err := e.store.ClaimActions(ctx, 10, e.clock.Now().UnixMilli(), time.Minute)
+	if err != nil || len(got) != 3 || got[0].ID != draftID || got[0].Type != "draft" {
+		t.Fatalf("claim drafts: %+v %v", got, err)
+	}
+	var p ActionPayload
+	_ = json.Unmarshal(got[0].Payload, &p)
+	if len(p.To) != 1 || p.Subject != "Homework question" {
+		t.Fatalf("payload: %+v", p)
+	}
+	if _, _, err := e.store.CompleteAction(ctx, draftID, ActionResult{MessageID: "d1", ThreadID: "d1", DraftID: "r-123"}, e.clock.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	out, _, _ = e.call("list_outgoing", map[string]any{"status": "done"})
+	item := obj(list(out["outgoing"])[0])
+	if str(item["draft_id"]) != "r-123" || str(item["draft_message_id"]) != "d1" || item["sent_message_id"] != nil ||
+		!strings.HasSuffix(str(item["gmail_url"]), "#drafts?compose=d1") || !strings.Contains(str(item["status_meaning"]), "not sent") {
+		t.Fatalf("finished draft: %v", item)
+	}
+}
+
 func TestMCPReadOnlyMode(t *testing.T) {
 	e := newMCPEnv(t, false)
 	for _, raw := range list(obj(e.rpc("tools/list", map[string]any{})["result"])["tools"]) {
-		if name := str(obj(raw)["name"]); name == "send_email" || name == "reply_to_email" || name == "cancel_email" {
+		if name := str(obj(raw)["name"]); name == "send_email" || name == "reply_to_email" || name == "create_draft" || name == "cancel_email" {
 			t.Errorf("%s listed in read-only mode", name)
 		}
 	}
@@ -389,8 +462,18 @@ func TestParseMailQuery(t *testing.T) {
 	if p.FTS != `"permission form" AND "form"*` {
 		t.Fatalf("fts: %q", p.FTS)
 	}
-	if len(ignored) != 1 || !strings.HasPrefix(ignored[0], "-spam") {
-		t.Fatalf("ignored: %v", ignored)
+	if len(ignored) != 0 || p.NotFTS != `"spam"` {
+		t.Fatalf("exclusion: ignored %v, not %q", ignored, p.NotFTS)
+	}
+
+	p, ignored, _ = parseMailQuery(`-from:noreply -"lunch menu" -label:Newsletters -category:promotions -is:starred -is:read -has:attachment -filename:pdf -subject:fwd -to:me -in:sent -older_than:7d -thread:abc`, now, "me@x.org")
+	if p.NotFrom[0] != "noreply" || p.NotFTS != `"lunch menu"` || p.NotLabels[0] != "Newsletters" || p.NotLabels[1] != "CATEGORY_PROMOTIONS" ||
+		p.NotLabels[2] != "SENT" || p.Starred == nil || *p.Starred || p.Unread == nil || !*p.Unread || p.HasAttach == nil || *p.HasAttach ||
+		p.NotAttachName[0] != "pdf" || p.NotSubject[0] != "fwd" || p.NotTo[0] != "me@x.org" || p.After != now.Add(-7*24*time.Hour).UnixMilli() {
+		t.Fatalf("exclusions: %+v", p)
+	}
+	if len(ignored) != 1 || !strings.HasPrefix(ignored[0], "-thread:abc") {
+		t.Fatalf("unsupported exclusion should be reported: %v", ignored)
 	}
 
 	p, _, _ = parseMailQuery(`essay OR paper deadline from:me in:anywhere after:2026/10/01 before:2026-10-05`, now, "me@x.org")

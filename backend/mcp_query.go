@@ -15,14 +15,17 @@ import (
 //	is:unread|read|starred|important  in:inbox|sent|trash|spam|anywhere|starred
 //	has:attachment  after:/before:/newer:/older: (YYYY/MM/DD, YYYY-MM-DD or Unix time)
 //	newer_than:/older_than: (Nh, Nd, Nw, Nm, Ny)  "exact phrase"  a OR b  word*
+//	-word  -"phrase"  -from:  -to:  -subject:  -label:  -category:  -filename:  -is:  -in:  -has:
 //
-// Plain words are matched with the full-text index (all must match). Operators
-// it cannot express (negation, unknown keys) are returned in ignored, so the
-// caller can say so instead of silently returning different results.
+// Plain words are matched with the full-text index (all must match); a leading
+// minus excludes. Operators it cannot express (unknown keys, negated dates) are
+// returned in ignored, so the caller can say so instead of silently returning
+// different results.
 func parseMailQuery(q string, now time.Time, me string) (SearchParams, []string, error) {
 	var p SearchParams
 	var ignored []string
 	var groups [][]string // full-text terms; terms in one group are ORed, groups are ANDed
+	var excluded []string // full-text terms to exclude
 	orNext := false
 
 	addTerm := func(term string) {
@@ -34,21 +37,34 @@ func parseMailQuery(q string, now time.Time, me string) (SearchParams, []string,
 		orNext = false
 	}
 	setBool := func(dst **bool, v bool) { *dst = &v }
+	addLabel := func(neg bool, label string) {
+		if neg {
+			p.NotLabels = append(p.NotLabels, label)
+		} else {
+			p.Label = label
+		}
+	}
 
 	for _, tok := range tokenizeQuery(q) {
 		if tok == "OR" || tok == "|" {
 			orNext = len(groups) > 0
 			continue
 		}
-		if strings.HasPrefix(tok, "-") && len(tok) > 1 {
-			ignored = append(ignored, tok+" (exclusion is not supported)")
-			continue
+		neg := strings.HasPrefix(tok, "-") && len(tok) > 1
+		orig := tok
+		if neg {
+			tok = tok[1:]
+			orNext = false // "a OR -b" is read as "a -b"
 		}
 		key, val, isOp := strings.Cut(tok, ":")
 		key = strings.ToLower(key)
 		if !isOp || !queryOperators[key] || val == "" {
 			if term := ftsTerm(tok); term != "" {
-				addTerm(term)
+				if neg {
+					excluded = append(excluded, term)
+				} else {
+					addTerm(term)
+				}
 			}
 			continue
 		}
@@ -57,73 +73,106 @@ func parseMailQuery(q string, now time.Time, me string) (SearchParams, []string,
 		switch key {
 		case "from":
 			if lower == "me" {
-				if me != "" {
-					p.From = me
-				} else {
-					p.Label = "SENT"
+				if me == "" {
+					addLabel(neg, "SENT")
+					continue
 				}
+				val = me
+			}
+			if neg {
+				p.NotFrom = append(p.NotFrom, val)
 			} else {
 				p.From = val
 			}
 		case "to", "cc", "bcc":
 			if lower == "me" {
 				if me == "" {
-					ignored = append(ignored, tok+" (your address is not known yet)")
+					ignored = append(ignored, orig+" (your address is not known yet)")
 					continue
 				}
 				val = me
 			}
-			p.To = val
+			if neg {
+				p.NotTo = append(p.NotTo, val)
+			} else {
+				p.To = val
+			}
 		case "subject":
-			p.Subject = val
+			if neg {
+				p.NotSubject = append(p.NotSubject, val)
+			} else {
+				p.Subject = val
+			}
 		case "label":
-			p.Label = val
+			addLabel(neg, val)
 		case "category":
-			p.Label = "CATEGORY_" + strings.ToUpper(val)
+			addLabel(neg, "CATEGORY_"+strings.ToUpper(val))
 		case "filename":
-			p.AttachName = val
+			if neg {
+				p.NotAttachName = append(p.NotAttachName, val)
+			} else {
+				p.AttachName = val
+			}
 		case "thread":
+			if neg {
+				ignored = append(ignored, orig+" (exclusion is not supported)")
+				continue
+			}
 			p.ThreadID = val
 		case "is":
 			switch lower {
 			case "unread":
-				setBool(&p.Unread, true)
+				setBool(&p.Unread, !neg)
 			case "read":
-				setBool(&p.Unread, false)
+				setBool(&p.Unread, neg)
 			case "starred":
-				setBool(&p.Starred, true)
+				setBool(&p.Starred, !neg)
 			case "important":
-				p.Label = "IMPORTANT"
+				addLabel(neg, "IMPORTANT")
 			default:
-				ignored = append(ignored, tok)
+				ignored = append(ignored, orig)
 			}
 		case "in":
 			switch lower {
 			case "inbox":
-				setBool(&p.InInbox, true)
+				setBool(&p.InInbox, !neg)
 			case "sent":
-				p.Label = "SENT"
+				addLabel(neg, "SENT")
 			case "starred":
-				setBool(&p.Starred, true)
+				setBool(&p.Starred, !neg)
 			case "trash", "spam":
+				if neg {
+					continue // already left out unless in:anywhere
+				}
 				p.Label, p.WithTrash = strings.ToUpper(lower), true
 			case "anywhere":
+				if neg {
+					ignored = append(ignored, orig)
+					continue
+				}
 				p.WithTrash = true
 			default:
-				ignored = append(ignored, tok)
+				ignored = append(ignored, orig)
 			}
 		case "has":
 			if lower == "attachment" || lower == "attachments" {
-				setBool(&p.HasAttach, true)
+				setBool(&p.HasAttach, !neg)
 			} else {
-				ignored = append(ignored, tok)
+				ignored = append(ignored, orig)
 			}
 		case "after", "newer", "before", "older":
 			ms, err := parseQueryDate(val)
 			if err != nil {
-				return p, nil, fmt.Errorf("%s: %w", tok, err)
+				return p, nil, fmt.Errorf("%s: %w", orig, err)
 			}
-			if key == "after" || key == "newer" {
+			if neg {
+				// -after:X is before:X and the other way round.
+				if key == "after" || key == "newer" {
+					p.Before = ms
+				} else {
+					p.After = ms
+				}
+			} else if key == "after" || key == "newer" {
 				p.After = ms
 			} else {
 				p.Before = ms
@@ -131,9 +180,9 @@ func parseMailQuery(q string, now time.Time, me string) (SearchParams, []string,
 		case "newer_than", "older_than":
 			d, err := parseRelative(lower)
 			if err != nil {
-				return p, nil, fmt.Errorf("%s: %w", tok, err)
+				return p, nil, fmt.Errorf("%s: %w", orig, err)
 			}
-			if key == "newer_than" {
+			if (key == "newer_than") != neg {
 				p.After = now.Add(-d).UnixMilli()
 			} else {
 				p.Before = now.Add(-d).UnixMilli()
@@ -154,6 +203,17 @@ func parseMailQuery(q string, now time.Time, me string) (SearchParams, []string,
 		}
 	}
 	p.FTS = strings.Join(parts, " AND ")
+	if len(excluded) > 16 {
+		excluded = excluded[:16]
+		ignored = append(ignored, "excluded terms after the 16th")
+	}
+	p.NotFTS = strings.Join(excluded, " OR ")
+	for _, l := range []*[]string{&p.NotFrom, &p.NotTo, &p.NotSubject, &p.NotLabels, &p.NotAttachName} {
+		if len(*l) > 16 {
+			*l = (*l)[:16]
+			ignored = append(ignored, "exclusions after the 16th of one kind")
+		}
+	}
 	return p, ignored, nil
 }
 

@@ -154,7 +154,8 @@ func (s *Server) toolGetAttachment(ctx context.Context, args json.RawMessage) (a
 		if len(labels) > 0 {
 			meta["images"] = labels
 		}
-		notes = append(notes, "Images are attached as MCP image content. If you cannot see them, tell the user and point them to gmail_url.")
+		notes = append(notes, "The image is attached as MCP image content. Some clients (ChatGPT) do not pass MCP images to the model: "+
+			"if you cannot see it, tell the user briefly that this app cannot show you images and give them gmail_url to open it.")
 	}
 	if conv.Text == "" && len(conv.Images) == 0 && len(notes) == 0 {
 		notes = append(notes, "The file contains no readable text.")

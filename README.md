@@ -26,7 +26,8 @@ outgoing mail, without the server ever holding Google credentials.
 * **cloudflared** connects out to Cloudflare. No router ports are open, and
   Cloudflare terminates TLS.
 * **MCP endpoint** (same backend process, separate loopback port `127.0.0.1:8767`)
-  gives ChatGPT tools to search, read and send mail. Cloudflare never routes to
+  gives ChatGPT tools to search, read, send, forward and schedule mail, manage
+  drafts, and mark, label, archive or trash mail. Cloudflare never routes to
   it; ChatGPT reaches it only through an **OpenAI Secure MCP Tunnel**
   (`tunnel-client`, outbound-only), the same way the google-tasks MCP server on
   this machine is connected. See [ChatGPT (MCP)](#chatgpt-mcp).
@@ -136,16 +137,24 @@ calls to that URL. Nothing new is exposed to the internet:
 
 | Tool | Kind | What it does |
 | --- | --- | --- |
-| `search_emails` | read | Search or list mail, newest first, with Gmail-style operators: `from:` `to:` `subject:` `label:` `category:` `filename:` `is:unread/read/starred/important` `in:inbox/sent/trash/anywhere` `has:attachment` `after:`/`before:` `newer_than:`/`older_than:` `"phrase"` `a OR b` `word*`; paging with `next_cursor`. Each result lists its attachments (`attachment_id`, `filename`) |
+| `search_emails` | read | Search or list mail, newest first, with Gmail-style operators: `from:` `to:` `subject:` `label:` `category:` `filename:` `is:unread/read/starred/important` `in:inbox/sent/trash/anywhere` `has:attachment` `after:`/`before:` `newer_than:`/`older_than:` `"phrase"` `a OR b` `word*`, and exclusions with a leading minus (`-word` `-"phrase"` `-from:` `-to:` `-subject:` `-label:` `-category:` `-filename:` `-is:` `-in:` `-has:`); paging with `next_cursor`. Each result lists its attachments (`attachment_id`, `filename`) |
 | `get_email` | read | One email: headers, labels, attachments (`attachment_id`, filename, type, size), plain-text body (capped, default 20,000 characters) |
 | `get_thread` | read | A conversation, oldest first (newest 20 messages, 4,000 characters each by default), with each message's attachments |
 | `get_attachment` | read | Downloads one attachment from Gmail on demand and returns its text (PDF, Word, text/CSV) or image; see [Attachments](#attachments) |
 | `search`, `fetch` | read | OpenAI's standard search/fetch shapes, used by deep research |
-| `mailbox_status` | read | Message counts, stored date range, last Gmail sync, outgoing queue |
-| `list_outgoing` | read | Queued/sent/failed outgoing mail and its status |
-| `send_email` | write | Queue a new plain-text email |
-| `reply_to_email` | write | Queue a reply (or reply-all) in the original Gmail thread |
-| `cancel_email` | write | Cancel a queued email before it is sent |
+| `list_labels` | read | The mailbox's labels with how many stored emails (and unread ones) carry each |
+| `list_drafts`, `get_draft` | read | The Gmail **Drafts** folder: recipients, subject, text, attachments, whether it is a reply (needs Code.gs 1.3.0+) |
+| `mailbox_status` | read | Message counts, stored date range, last Gmail sync, last drafts sync, outgoing queue |
+| `list_outgoing` | read | Everything queued through the server (mail, drafts, draft edits, mailbox changes) and its status |
+| `send_email` | write | Queue a new plain-text email; `send_at` schedules it, `attachments` attaches files from other synced emails |
+| `reply_to_email` | write | Queue a reply (or reply-all) in the original Gmail thread; `send_at` and `attachments` as above |
+| `forward_email` | write | Forward an email with its attachments and an optional note; `send_at`, `attachments`, or `as_draft` to save it in Drafts instead (needs Code.gs 1.3.0+) |
+| `create_draft` | write | Save a new email, or a reply in an existing thread, in Gmail's **Drafts** folder without sending it; `attachments` as above (needs Code.gs 1.2.0+) |
+| `update_draft` | write | Change a draft's recipients, subject or text, add files or drop its files; it stays in its conversation (needs Code.gs 1.3.0+) |
+| `send_draft` | write | Send a draft as it is; `send_at` schedules it (needs Code.gs 1.3.0+) |
+| `delete_draft` | write | Permanently delete a draft, after the cancel window (needs Code.gs 1.3.0+) |
+| `update_emails` | write | Mark read/unread, star, mark important, archive or move to the inbox, add/remove labels, trash or restore; single emails or whole conversations, up to 100 per call (needs Code.gs 1.3.0+) |
+| `cancel_email` | write | Cancel anything queued (mail, draft, draft edit, mailbox change) before Apps Script performs it |
 
 Safety built in:
 
@@ -155,8 +164,24 @@ Safety built in:
 * Mail queued through ChatGPT waits `MCP_SEND_DELAY_SECONDS` (default 60 s) before
   Apps Script may send it, so "cancel that" still works. It goes out within about a
   minute after that.
-* An identical send/reply requested again within 10 minutes is not queued twice.
-* `MCP_ALLOW_SEND=false` in `backend.env` hides the write tools (read-only ChatGPT access).
+* `send_at` holds mail (and `send_draft`) until that time; it stays cancellable until
+  then and goes out within about a minute after it. Times without an offset are in
+  the server's time zone (`mailbox_status` shows `server_time`).
+* An identical send/reply/forward/draft requested again within 10 minutes is not queued twice.
+* Drafts are never sent, so they skip the send delay: Apps Script saves them on its
+  next run (within about a minute) and the user sends them from Gmail. Draft edits
+  also skip it; deleting a draft waits for the cancel window, because Gmail deletes
+  drafts permanently.
+* `update_draft` and `send_draft` refuse a draft that was edited in Gmail after the
+  server last synced it, so the model never overwrites or sends text it has not seen.
+* Mailbox changes (`update_emails`) are easy to undo, so they skip the send delay too.
+  The local copy changes at once, so `search_emails` reflects them; if the change is
+  cancelled or Gmail refuses it, the local copy is put back. Trash is Gmail's trash
+  (restorable for 30 days); nothing is permanently deleted. Labels must already exist.
+* Attached files (`attachments`) must belong to synced emails: at most 10 files and
+  20 MB per email. Apps Script downloads them from Gmail when it sends.
+* `MCP_ALLOW_SEND=false` in `backend.env` hides the write tools, including
+  `create_draft` (read-only ChatGPT access).
 * Logs record tool names and outcomes, never arguments or message text.
 
 ### Setup
@@ -280,13 +305,22 @@ disposition. `get_email` lists inline images of 64 KB or more separately as
 | Official MCP TypeScript SDK client 1.30.1 (validates every result against the schema) | ✓ | ✓ | ✓ |
 | Through `tunnel-client dev proxy` (the path ChatGPT uses), including a 9.5 MB resource | ✓ | ✓ | ✓ |
 | Claude Code (headless), a real model client | ✓ read the PDF, DOCX and CSV text | ✓ read the text in a JPEG, a scaled PNG and a scanned PDF page | saves the blob to a file in its session folder |
-| ChatGPT | expected ✓ (plain text blocks) | **not guaranteed**: OpenAI says connector image output "should not currently be treated as a guaranteed" vision input ([forum, 2026](https://community.openai.com/t/chatgpt-connector-returns-empty-for-mcp-tool-results-with-type-image-while-same-tool-works-in-mcp-inspector/1375446)) | not used |
+| ChatGPT (tested 2026-10-09 with the web app deployed) | ✓ PDF text | **✗ the model never sees images** | not used |
 
-ChatGPT was not tested end to end: that needs the updated Apps Script deployed and a
-ChatGPT session. For ChatGPT, text formats are the reliable path; for images and
-scanned pages the metadata tells the model to say so and point to `gmail_url` if it
-cannot see them. Text recognition (OCR) would need `tesseract`, which this server does
-not run (CPU).
+**ChatGPT does not show images to the model.** Tested against the live server: for a
+GIF attachment the backend returned the metadata text block and a valid image block
+(`image/gif`, 3,053 bytes, `GIF89a`), and ChatGPT passed only the text on to the model.
+This is a ChatGPT limitation, not a server bug: OpenAI says connector image output
+"should not currently be treated as a guaranteed" vision input
+([forum](https://community.openai.com/t/chatgpt-connector-returns-empty-for-mcp-tool-results-with-type-image-while-same-tool-works-in-mcp-inspector/1375446)),
+and others report the same for PNG
+([forum](https://community.openai.com/t/mcp-tool-returns-an-image-successfully-but-chatgpt-shows-only-text-no-image-or-widget/1399928)).
+Changing the image format (for example GIF to PNG) does not help. In ChatGPT, use
+attachments with text (PDF with a text layer, Word, text, CSV); for images and scanned
+PDF pages the metadata tells the model to say it cannot see them and give you the
+`gmail_url`. Clients that pass MCP images on (Claude) read them. Making images readable
+in ChatGPT would need the server to turn them into text first: local OCR (`tesseract`)
+or a vision-model API. Neither is enabled here.
 
 ### Retrieval: web app or relay
 
@@ -382,12 +416,13 @@ All bodies are JSON. `Authorization: Bearer <secret>`.
 | `POST /v1/sync/known` | SYNC | `{"ids":[…]}` → `{"unknown":[…]}` |
 | `POST /v1/sync/state` | SYNC | label/read-state changes or deletions → `{"unknown":[…]}` |
 | `POST /v1/sync/labels` | SYNC | label ID → name table |
+| `POST /v1/sync/drafts` | SYNC | `{"drafts":[{"id","messageId","threadId"}],"messages":[…]}`: the whole Drafts folder (≤ 500), plus normalized content (≤ 20 per call) of drafts the backend asked for → `{"stored","removed","need":[draft IDs]}` |
 | `POST /v1/actions/poll` | SYNC | claim up to `limit` (≤ 20) ready actions; 10-minute lease. In relay mode the response also carries `attachmentRequests` |
 | `POST /v1/attachments/relay/{id}` | SYNC | relay mode: the requested attachment (`{"ok":true,"data":<base64>,"size":n}` or `{"ok":false,"error":{…}}`); 410 when nobody waits any more |
 | `POST /v1/sync/attachments` | SYNC | `{"messages":[{"id","attachments":[…]}]}`: replace attachment metadata of stored messages (backfill) → `{"updated","unchanged","unknown":[…]}` |
-| `POST /v1/actions/{id}/complete` | SYNC | `{"claimId","result":{"messageId","threadId"}}`; repeatable |
+| `POST /v1/actions/{id}/complete` | SYNC | `{"claimId","result":{"messageId","threadId","draftId"}}` (modify: `{"modified","missing":[…]}`); repeatable |
 | `POST /v1/actions/{id}/fail` | SYNC | `{"claimId","error","retryable"}`; retryable → backoff 30 s … 30 min, max 5 attempts |
-| `POST /v1/actions` | API, local only | queue `send` or `reply` (below) |
+| `POST /v1/actions` | API, local only | queue an action (types below) |
 | `GET /v1/actions[?status=]`, `GET /v1/actions/{id}` | API, local only | inspect the queue |
 | `POST /v1/actions/{id}/cancel` | API, local only | cancel a pending action |
 | `GET /v1/messages` | API, local only | search: `q` (words, `term*` prefix), `fts` (raw FTS5), `from`, `to`, `subject`, `label` (ID or name), `threadId`, `unread`, `starred`, `inbox`, `after`, `before` (RFC 3339, `YYYY-MM-DD` or Unix time), `includeTrash`, `limit` ≤ 100, `cursor` |
@@ -412,11 +447,25 @@ ses http://127.0.0.1:8766/v1/actions -d '{"type":"send","to":["teacher@school.or
 ses http://127.0.0.1:8766/v1/actions -d '{"type":"reply","messageId":"19a3f…","replyAll":false,"body":"Thanks!"}'
 ```
 
-Send/reply payload fields: `to`, `cc`, `bcc` (arrays of single addresses, at most 50
-in total), `subject` (send only), `body` (plain text; derived from `htmlBody` if
-omitted), `htmlBody`, `messageId` or `threadId` (reply), `replyAll`,
-`idempotencyKey` (repeating a request with the same key returns the original
-action). A queued action is sent within about a minute by the Apps Script trigger.
+Action types and their fields (anything else is refused):
+
+| `type` | Fields |
+| --- | --- |
+| `send`, `draft` | `to`, `cc`, `bcc` (arrays of single addresses, at most 50 in total), `subject`, `body` (plain text; derived from `htmlBody` if omitted), `htmlBody`, `attachments`. `send` needs `to` and `subject` |
+| `reply`, `draft_reply` | `messageId` (preferred) or `threadId`, `replyAll`, `cc`, `bcc`, `body`, `htmlBody`, `attachments` |
+| `forward`, `draft_forward` | `messageId`, `to` (required for `forward`), `cc`, `bcc`, `body` (note above the forwarded email, optional), `attachments` |
+| `modify` | `messageIds` and/or `threadIds` (≤ 100 together), `addLabelIds`, `removeLabelIds` (label IDs; not SENT, DRAFT, CHAT, SPAM or TRASH), `trash` or `untrash` |
+| `draft_update` | `draftId`, `draftMessageId` (the draft's current message ID; refused if it changed), `to`, `cc`, `bcc`, `subject`, `body`, `htmlBody` (the full new content), `attachments` (added), `dropAttachments` |
+| `draft_send` | `draftId`, optional `draftMessageId` |
+| `draft_delete` | `draftId` |
+
+All types take `idempotencyKey` (repeating a request with the same key returns the
+original action). `send`, `reply`, `forward` and `draft_send` take `sendAt` (RFC 3339)
+to hold the action until then. `attachments` is a list of
+`{"messageId","attachmentId"}` (the attachment's part ID as stored, see
+`GET /v1/messages/{id}`). A queued action is performed within about a minute by the
+Apps Script trigger. A `modify` also changes the stored copy at once (undone if it is
+cancelled or finally fails).
 
 ## Service management
 
@@ -457,7 +506,8 @@ the Apps Script editor → Executions.
 (one row per Gmail message ID, with headers, text/HTML bodies, label IDs and derived
 flags, sync timestamps), `attachments` (metadata only: part ID, name, type, size,
 Content-ID, inline/hidden flags; content is never stored), `messages_fts` (FTS5 over
-subject, from, to, cc, body), `labels`, `actions`, `kv`. The schema is versioned with
+subject, from, to, cc, body), `labels`, `actions`, `drafts` (the Gmail Drafts folder:
+recipients, subject, text and attachment names of each draft), `kv`. The schema is versioned with
 `PRAGMA user_version` and migrated on startup.
 
 Ad-hoc queries (read-only):
@@ -523,7 +573,11 @@ is updated with the system: `sudo apt upgrade cloudflared`, then
 | `get_attachment`: "rejected the request signature" | `ATTACHMENT_FETCH_SECRET` in `backend.env` ≠ the Script Property |
 | `get_attachment`: "answered HTTP … instead of JSON" / "doPost" | wrong `/exec` URL, or the deployed version predates `doPost`: publish a new version |
 | `get_attachment`: "has not picked up the request yet" (relay) | the trigger runs once a minute: call again; if it persists, `mailbox_status` → `sync`, and Code.gs must be 1.1.0+ |
+| `create_draft` fails with `unsupported action type: draft` | Code.gs is older than 1.2.0: paste the new `Code.gs` into Apps Script and save |
+| `update_emails`, `forward_email` or a draft tool fails with `unsupported action type`, or `list_drafts` says the Drafts folder was never synced | Code.gs is older than 1.3.0: paste the new `Code.gs` into Apps Script and save |
+| `update_draft`/`send_draft` fails with "changed in Gmail after it was read" | the draft was edited in Gmail; it syncs within a minute: read it again with `get_draft` and retry |
 | `get_attachment`: "rejected … as expired" | this server's clock is off: `timedatectl` |
+| ChatGPT: "cannot see the image" although `format` is `image` | expected: ChatGPT drops MCP image content (see [Client support](#client-support-verified)); open the image via `gmail_url` |
 | PDF returns "not installed" / runs unsandboxed | `sudo apt install poppler-utils bubblewrap`; the backend logs which mode it uses |
 | `~/.local/state/school-email-sync` is a symlink | systemd's legacy-layout migration; stop the service, move `mail.db*` into a real directory, re-run `make install` |
 

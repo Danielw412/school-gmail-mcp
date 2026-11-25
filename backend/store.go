@@ -98,7 +98,7 @@ func (s *Store) Backup(ctx context.Context, dest string) error {
 }
 
 // migrations[i] upgrades the schema from user_version i to i+1.
-var migrations = []string{schemaV1, schemaV2}
+var migrations = []string{schemaV1, schemaV2, schemaV3, schemaV4}
 
 func (s *Store) migrate(ctx context.Context) error {
 	var v int
@@ -256,6 +256,90 @@ ALTER TABLE attachments DROP COLUMN sha256;
 ALTER TABLE attachments DROP COLUMN fetched_at;
 ALTER TABLE attachments ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
 UPDATE attachments SET hidden = ` + attachmentHiddenSQL + `;
+`
+
+// schemaV3 adds the draft action types. SQLite cannot change a CHECK constraint
+// in place, so the actions table is rebuilt (nothing references it).
+const schemaV3 = `
+CREATE TABLE actions_v3 (
+  id              TEXT PRIMARY KEY,
+  type            TEXT NOT NULL CHECK (type IN ('send', 'reply', 'draft', 'draft_reply')),
+  status          TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'done', 'failed', 'cancelled')),
+  payload         TEXT NOT NULL,
+  idempotency_key TEXT UNIQUE,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  max_attempts    INTEGER NOT NULL,
+  claim_id        TEXT,
+  lease_until     INTEGER,
+  not_before      INTEGER NOT NULL,
+  last_error      TEXT,
+  result          TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  finished_at     INTEGER
+);
+INSERT INTO actions_v3 (rowid, id, type, status, payload, idempotency_key, attempts, max_attempts, claim_id,
+  lease_until, not_before, last_error, result, created_at, updated_at, finished_at)
+SELECT rowid, id, type, status, payload, idempotency_key, attempts, max_attempts, claim_id,
+  lease_until, not_before, last_error, result, created_at, updated_at, finished_at FROM actions;
+DROP TABLE actions;
+ALTER TABLE actions_v3 RENAME TO actions;
+CREATE INDEX actions_queue   ON actions(status, not_before, created_at);
+CREATE INDEX actions_created ON actions(created_at DESC);
+`
+
+// schemaV4 adds the mailbox-change, forward and existing-draft action types, and
+// local_undo: for a "modify" action, the label sets the local copy had before the
+// change was applied optimistically (JSON {gmail_id: [label ids]}), so cancelling
+// it or a final failure puts them back. The drafts table mirrors Gmail's Drafts
+// folder (synced by Apps Script; drafts are not part of the messages table).
+const schemaV4 = `
+CREATE TABLE actions_v4 (
+  id              TEXT PRIMARY KEY,
+  type            TEXT NOT NULL CHECK (type IN ('send', 'reply', 'draft', 'draft_reply', 'forward', 'draft_forward',
+                                                'modify', 'draft_update', 'draft_delete', 'draft_send')),
+  status          TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'done', 'failed', 'cancelled')),
+  payload         TEXT NOT NULL,
+  idempotency_key TEXT UNIQUE,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  max_attempts    INTEGER NOT NULL,
+  claim_id        TEXT,
+  lease_until     INTEGER,
+  not_before      INTEGER NOT NULL,
+  last_error      TEXT,
+  result          TEXT,
+  local_undo      TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  finished_at     INTEGER
+);
+INSERT INTO actions_v4 (rowid, id, type, status, payload, idempotency_key, attempts, max_attempts, claim_id,
+  lease_until, not_before, last_error, result, created_at, updated_at, finished_at)
+SELECT rowid, id, type, status, payload, idempotency_key, attempts, max_attempts, claim_id,
+  lease_until, not_before, last_error, result, created_at, updated_at, finished_at FROM actions;
+DROP TABLE actions;
+ALTER TABLE actions_v4 RENAME TO actions;
+CREATE INDEX actions_queue   ON actions(status, not_before, created_at);
+CREATE INDEX actions_created ON actions(created_at DESC);
+
+CREATE TABLE drafts (
+  draft_id            TEXT PRIMARY KEY,
+  message_id          TEXT NOT NULL,          -- changes every time the draft is edited
+  thread_id           TEXT NOT NULL DEFAULT '',
+  has_content         INTEGER NOT NULL DEFAULT 0,  -- 0 until Apps Script sent this message_id's content
+  to_addrs            TEXT NOT NULL DEFAULT '',
+  cc_addrs            TEXT NOT NULL DEFAULT '',
+  bcc_addrs           TEXT NOT NULL DEFAULT '',
+  subject             TEXT NOT NULL DEFAULT '',
+  in_reply_to         TEXT NOT NULL DEFAULT '',
+  internal_date       INTEGER NOT NULL DEFAULT 0,
+  body_text           TEXT,
+  body_text_truncated INTEGER NOT NULL DEFAULT 0,
+  body_text_derived   INTEGER NOT NULL DEFAULT 0,
+  attachments         TEXT NOT NULL DEFAULT '[]', -- JSON [{filename, mimeType, size}]
+  synced_at           INTEGER NOT NULL
+);
+CREATE INDEX drafts_by_date ON drafts(internal_date DESC);
 `
 
 // attachmentHiddenSQL decides whether an attachments row is part of the message

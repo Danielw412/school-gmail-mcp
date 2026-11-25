@@ -91,6 +91,7 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("POST /v1/sync/known", s.guard(roleSync, maxListBody, s.handleKnown))
 	mux.Handle("POST /v1/sync/state", s.guard(roleSync, maxListBody, s.handleState))
 	mux.Handle("POST /v1/sync/labels", s.guard(roleSync, maxListBody, s.handleLabels))
+	mux.Handle("POST /v1/sync/drafts", s.guard(roleSync, maxIngestBody, s.handleDrafts))
 	mux.Handle("POST /v1/actions/poll", s.guard(roleSync, maxSmallBody, s.handlePoll))
 	mux.Handle("POST /v1/actions/{id}/complete", s.guard(roleSync, maxSmallBody, s.handleComplete))
 	mux.Handle("POST /v1/actions/{id}/fail", s.guard(roleSync, maxSmallBody, s.handleFail))
@@ -518,6 +519,27 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"stored": n})
 }
 
+func (s *Server) handleDrafts(w http.ResponseWriter, r *http.Request) {
+	var req DraftSyncRequest
+	if err := decodeJSON(r.Body, &req); err != nil {
+		s.badRequest(w, err)
+		return
+	}
+	if err := req.validate(); err != nil {
+		s.badRequest(w, err)
+		return
+	}
+	sum, err := s.store.SyncDrafts(r.Context(), req, s.nowMS())
+	if err != nil {
+		s.storeError(w, r, err)
+		return
+	}
+	if sum.Stored > 0 || sum.Removed > 0 {
+		s.log.Info("drafts synced", "drafts", sum.Drafts, "stored", sum.Stored, "removed", sum.Removed, "need", len(sum.Need))
+	}
+	writeJSON(w, http.StatusOK, sum)
+}
+
 func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 	req := struct {
 		Limit int `json:"limit"`
@@ -565,11 +587,15 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	for _, id := range []string{req.Result.MessageID, req.Result.ThreadID} {
+	for _, id := range append([]string{req.Result.MessageID, req.Result.ThreadID, req.Result.DraftID}, req.Result.Missing...) {
 		if id != "" && !gmailIDPattern.MatchString(id) {
 			s.badRequest(w, errors.New("result: invalid Gmail id"))
 			return
 		}
+	}
+	if len(req.Result.Missing) > maxModifyTargets || req.Result.Modified < 0 {
+		s.badRequest(w, errors.New("result: invalid modify counts"))
+		return
 	}
 	a, already, err := s.store.CompleteAction(r.Context(), r.PathValue("id"), req.Result, s.nowMS())
 	if err != nil {
@@ -620,7 +646,12 @@ func (s *Server) handleCreateAction(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, err)
 		return
 	}
-	a, created, err := s.store.CreateAction(r.Context(), req.Type, payload, req.IdempotencyKey, s.cfg.ActionMaxAttempts, s.nowMS(), 0)
+	sendAt, err := parseSendAt(req.SendAt)
+	if err != nil {
+		s.badRequest(w, err)
+		return
+	}
+	a, created, err := s.store.CreateAction(r.Context(), req.Type, payload, req.IdempotencyKey, s.cfg.ActionMaxAttempts, s.nowMS(), sendAt)
 	if err != nil {
 		s.storeError(w, r, err)
 		return

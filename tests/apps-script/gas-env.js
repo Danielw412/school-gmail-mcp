@@ -60,6 +60,75 @@ function toSignedBytes(buf) {
   return Array.from(buf, (b) => (b > 127 ? b - 256 : b));
 }
 
+/** Bytes given to Apps Script APIs: a signed byte array, a Buffer or a string (UTF-8). */
+function toBuffer(data) {
+  if (Buffer.isBuffer(data)) return data;
+  if (typeof data === 'string') return Buffer.from(data, 'utf8');
+  return Buffer.from(data.map((b) => b & 0xff));
+}
+
+/** A Blob as Apps Script's Utilities.newBlob / GmailAttachment returns it. */
+function makeBlob(data, contentType, name) {
+  const buf = toBuffer(data);
+  return {
+    _buf: buf,
+    getBytes: () => toSignedBytes(buf),
+    getName: () => name,
+    getContentType: () => contentType,
+    getDataAsString: (charset) => new TextDecoder(String(charset || 'utf-8').toLowerCase(), { fatal: false }).decode(buf),
+  };
+}
+
+/** RFC 2047 encoded words (UTF-8, B encoding) back to text. */
+function decodeWords(s) {
+  return String(s || '').replace(/\?=\s+=\?/g, '?==?')
+    .replace(/=\?UTF-8\?B\?([^?]*)\?=/gi, (m, b) => Buffer.from(b, 'base64').toString('utf8'));
+}
+
+/** Parses the MIME text Code.gs builds for draft edits into headers, text, html and files. */
+function parseMime(raw) {
+  const split = raw.indexOf('\r\n\r\n');
+  const head = split < 0 ? raw : raw.slice(0, split);
+  const body = split < 0 ? '' : raw.slice(split + 4);
+  const headers = {};
+  head.replace(/\r\n[ \t]/g, ' ').split('\r\n').forEach((line) => {
+    const i = line.indexOf(':');
+    if (i > 0) headers[line.slice(0, i).toLowerCase()] = line.slice(i + 1).trim();
+  });
+  const type = headers['content-type'] || 'text/plain';
+  const out = { headers, text: '', html: '', files: [] };
+  const walk = (h, b) => {
+    const ct = h['content-type'] || 'text/plain';
+    if (/^multipart\//i.test(ct)) {
+      const boundary = /boundary="([^"]+)"/.exec(ct)[1];
+      b.split('--' + boundary).slice(1, -1).forEach((p) => {
+        const part = p.replace(/^\r\n/, '').replace(/\r\n$/, '');
+        const at = part.indexOf('\r\n\r\n');
+        const ph = {};
+        part.slice(0, at).split('\r\n').forEach((line) => {
+          const i = line.indexOf(':');
+          if (i > 0) ph[line.slice(0, i).toLowerCase()] = line.slice(i + 1).trim();
+        });
+        walk(ph, part.slice(at + 4));
+      });
+      return;
+    }
+    const data = /base64/i.test(h['content-transfer-encoding'] || '') ? Buffer.from(b.replace(/\s+/g, ''), 'base64') : Buffer.from(b);
+    const disp = h['content-disposition'] || '';
+    if (/^attachment/i.test(disp)) {
+      const star = /filename\*=UTF-8''([^;]+)/i.exec(disp);
+      const plain = /filename="([^"]*)"/i.exec(disp);
+      out.files.push({ filename: star ? decodeURIComponent(star[1]) : (plain ? plain[1] : ''), mimeType: ct.split(';')[0].trim(), data });
+    } else if (/^text\/html/i.test(ct)) {
+      out.html = data.toString('utf8');
+    } else {
+      out.text = data.toString('utf8');
+    }
+  };
+  walk({ 'content-type': type, 'content-transfer-encoding': headers['content-transfer-encoding'] }, body);
+  return out;
+}
+
 class FakeMailbox {
   constructor(me) {
     this.me = me;
@@ -71,8 +140,9 @@ class FakeMailbox {
     this.seq = 0;
     this.attData = {};
     this.sent = [];
+    this.drafts = [];
     this.sendFailure = null;
-    this.calls = { get: 0, list: 0, history: 0, attachmentGet: 0, getOpts: [] };
+    this.calls = { get: 0, list: 0, history: 0, attachmentGet: 0, getOpts: [], draftsList: 0, modify: [] };
   }
 
   newId() {
@@ -110,7 +180,7 @@ class FakeMailbox {
     const date = spec.date || Date.now();
     const headers = [
       { name: 'From', value: spec.from || 'Ms. Rivera <rivera@school.example.org>' },
-      { name: 'To', value: spec.to || this.me },
+      { name: 'To', value: spec.to !== undefined ? spec.to : this.me },
       { name: 'Subject', value: spec.subject || 'Hello ' + id },
       { name: 'Date', value: new Date(date).toUTCString() },
       { name: 'Message-ID', value: `<${id}@mail.example.org>` },
@@ -169,6 +239,66 @@ class FakeMailbox {
       id: String(this.historyId),
       labelsRemoved: [{ message: { id, threadId: m.threadId, labelIds: labelIds.slice() }, labelIds: ['UNREAD'] }],
     });
+  }
+
+  /** Adds and removes labels the way Gmail does, with a history record. */
+  modifyLabels(id, add = [], remove = []) {
+    const m = this.msgs.get(id);
+    const set = new Set(m.labelIds);
+    remove.forEach((l) => set.delete(l));
+    add.forEach((l) => set.add(l));
+    m.labelIds = [...set];
+    this.historyId += 1;
+    this.history.push({ id: String(this.historyId), labelsAdded: [{ message: { id, threadId: m.threadId, labelIds: m.labelIds.slice() }, labelIds: add }] });
+  }
+
+  /** A draft created in Gmail by the user (not by the script). */
+  addDraft(spec) {
+    const id = this.add(Object.assign({ from: this.me, labelIds: ['DRAFT'] }, spec));
+    const entry = { id, draftId: 'r-' + id, threadId: this.msgs.get(id).threadId, to: spec.to, subject: spec.subject, body: spec.text };
+    this.drafts.push(entry);
+    return entry;
+  }
+
+  /** Drafts currently in the Drafts folder. */
+  liveDrafts() {
+    return this.drafts.filter((d) => !d.removed && !d.sentAs && this.msgs.has(d.id));
+  }
+
+  findDraft(draftId, what) {
+    const d = this.liveDrafts().find((x) => x.draftId === draftId);
+    if (!d) throw this.notFound(what);
+    return d;
+  }
+
+  /** The decoded text of the first part with this MIME type. */
+  partText(m, mime) {
+    let found = '';
+    const walk = (p) => {
+      if (found || !p) return;
+      if (p.mimeType === mime && !p.filename) {
+        const raw = p.body.data !== undefined ? p.body.data : this.attData[p.body.attachmentId];
+        if (raw !== undefined) found = (typeof raw === 'string' ? Buffer.from(raw, 'base64url') : toBuffer(raw)).toString('utf8');
+      }
+      (p.parts || []).forEach(walk);
+    };
+    walk(m.payload);
+    return found;
+  }
+
+  attachmentBlobs(m) {
+    const out = [];
+    const walk = (p) => {
+      if (!p) return;
+      if (p.filename) {
+        const raw = p.body.data !== undefined ? p.body.data : this.attData[p.body.attachmentId];
+        const buf = raw === undefined ? Buffer.alloc(0) : (typeof raw === 'string' ? Buffer.from(raw, 'base64url') : toBuffer(raw));
+        out.push(makeBlob(buf, p.mimeType, p.filename));
+      }
+      (p.parts || []).forEach(walk);
+    };
+    walk(m.payload);
+    return out;
   }
 
   remove(id) {
@@ -242,12 +372,91 @@ class FakeMailbox {
             if (offset + size < all.length) res.nextPageToken = String(offset + size);
             return res;
           },
+          batchModify: (resource) => {
+            box.calls.modify.push({ batch: resource.ids.slice() });
+            const unknown = resource.ids.find((id) => !box.msgs.has(id));
+            if (unknown) throw new Error('API call to gmail.users.messages.batchModify failed with error: Invalid id value');
+            resource.ids.forEach((id) => box.modifyLabels(id, resource.addLabelIds, resource.removeLabelIds));
+          },
+          modify: (resource, user, id) => {
+            box.calls.modify.push({ message: id });
+            if (!box.msgs.has(id)) throw box.notFound('messages.modify');
+            box.modifyLabels(id, resource.addLabelIds, resource.removeLabelIds);
+            return { id, labelIds: box.msgs.get(id).labelIds };
+          },
+          trash: (user, id) => {
+            if (!box.msgs.has(id)) throw box.notFound('messages.trash');
+            box.modifyLabels(id, ['TRASH'], []);
+          },
+          untrash: (user, id) => {
+            if (!box.msgs.has(id)) throw box.notFound('messages.untrash');
+            box.modifyLabels(id, [], ['TRASH']);
+          },
           Attachments: {
             get: (user, messageId, attachmentId) => {
               if (!attachmentId.startsWith('ANGjdJ_text_')) box.calls.attachmentGet += 1;
               if (!(attachmentId in box.attData)) throw box.notFound('messages.attachments.get');
               return { size: 1, data: box.attData[attachmentId] };
             },
+          },
+        },
+        Threads: (() => {
+          const inThread = (tid, what) => {
+            const ms = [...box.msgs.values()].filter((m) => m.threadId === tid);
+            if (!ms.length) throw box.notFound(what);
+            return ms;
+          };
+          return {
+            modify: (resource, user, tid) => {
+              box.calls.modify.push({ thread: tid });
+              inThread(tid, 'threads.modify').forEach((m) => box.modifyLabels(m.id, resource.addLabelIds, resource.removeLabelIds));
+            },
+            trash: (user, tid) => inThread(tid, 'threads.trash').forEach((m) => box.modifyLabels(m.id, ['TRASH'], [])),
+            untrash: (user, tid) => inThread(tid, 'threads.untrash').forEach((m) => box.modifyLabels(m.id, [], ['TRASH'])),
+          };
+        })(),
+        Drafts: {
+          list: (user, opts) => {
+            box.calls.draftsList += 1;
+            const all = box.liveDrafts();
+            const offset = opts && opts.pageToken ? Number(opts.pageToken) : 0;
+            const size = (opts && opts.maxResults) || 100;
+            const res = { drafts: all.slice(offset, offset + size).map((d) => ({ id: d.draftId, message: { id: d.id, threadId: d.threadId } })) };
+            if (offset + size < all.length) res.nextPageToken = String(offset + size);
+            return res;
+          },
+          get: (user, draftId, opts) => {
+            const d = box.findDraft(draftId, 'drafts.get');
+            const m = box.msgs.get(d.id);
+            if (opts && opts.format === 'full') return { id: draftId, message: JSON.parse(JSON.stringify(m)) };
+            return { id: draftId, message: { id: m.id, threadId: m.threadId, labelIds: m.labelIds.slice() } };
+          },
+          update: (resource, user, draftId) => {
+            const d = box.findDraft(draftId, 'drafts.update');
+            const raw = Buffer.from(resource.message.raw.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+            const parsed = parseMime(raw);
+            const h = parsed.headers;
+            box.remove(d.id);
+            const id = box.add({
+              threadId: resource.message.threadId, from: box.me, to: decodeWords(h.to || ''), cc: h.cc ? decodeWords(h.cc) : undefined,
+              subject: decodeWords(h.subject || ''), text: parsed.text, labelIds: ['DRAFT'], inReplyTo: h['in-reply-to'],
+              attachments: parsed.files.map((f) => ({ filename: f.filename, mimeType: f.mimeType, data: f.data })),
+            });
+            Object.assign(d, { id, raw, parsed, updates: (d.updates || 0) + 1 });
+            return { id: draftId, message: { id, threadId: resource.message.threadId, labelIds: ['DRAFT'] } };
+          },
+          send: (resource) => {
+            const d = box.findDraft(resource.id, 'drafts.send');
+            const m = box.msgs.get(d.id);
+            box.modifyLabels(m.id, ['SENT'], ['DRAFT']);
+            d.sentAs = m.id;
+            box.sent.push({ id: m.id, threadId: m.threadId, to: box.header(m, 'To'), subject: box.header(m, 'Subject'), body: box.partText(m, 'text/plain'), fromDraft: d.draftId });
+            return { id: m.id, threadId: m.threadId, labelIds: m.labelIds.slice() };
+          },
+          remove: (user, draftId) => {
+            const d = box.findDraft(draftId, 'drafts.delete');
+            box.remove(d.id);
+            d.removed = true;
           },
         },
         Labels: {
@@ -270,6 +479,14 @@ class FakeMailbox {
       getThread: () => ({ getId: () => m.threadId }),
       isDraft: () => m.labelIds.includes('DRAFT'),
       getFrom: () => box.header(m, 'From'),
+      getTo: () => box.header(m, 'To'),
+      getCc: () => box.header(m, 'Cc'),
+      getSubject: () => box.header(m, 'Subject'),
+      getHeader: (name) => box.header(m, name),
+      getDate: () => new Date(Number(m.internalDate)),
+      getPlainBody: () => box.partText(m, 'text/plain'),
+      getBody: () => box.partText(m, 'text/html') || box.partText(m, 'text/plain'),
+      getAttachments: () => box.attachmentBlobs(m),
       createDraftReply: (body, opts) => box.draft({ replyTo: m, all: false, body, opts }),
       createDraftReplyAll: (body, opts) => box.draft({ replyTo: m, all: true, body, opts }),
     });
@@ -288,7 +505,23 @@ class FakeMailbox {
 
   draft(spec) {
     const box = this;
-    return {
+    let saved = null; // the DRAFT message, created when the script first asks for it
+    const draft = {
+      getId: () => 'r-' + (saved || draft.getMessage().getId()),
+      getMessage() {
+        if (!saved) {
+          const r = spec.replyTo;
+          const to = r ? box.header(r, 'From') : spec.to;
+          const subject = r ? 'Re: ' + box.header(r, 'Subject') : spec.subject;
+          const opts = spec.opts || {};
+          saved = box.add({
+            threadId: r ? r.threadId : undefined, from: box.me, to, subject, cc: opts.cc,
+            text: spec.body, html: opts.htmlBody, labelIds: ['DRAFT'], inReplyTo: r ? box.header(r, 'Message-ID') : undefined,
+          });
+          box.drafts.push({ id: saved, draftId: 'r-' + saved, threadId: box.msgs.get(saved).threadId, to, subject, body: spec.body, opts, replyAll: !!spec.all });
+        }
+        return box.gmailApp()._wrap(box.msgs.get(saved));
+      },
       send() {
         if (box.sendFailure) {
           const f = box.sendFailure;
@@ -307,6 +540,7 @@ class FakeMailbox {
         return box.gmailApp()._wrap(box.msgs.get(id));
       },
     };
+    return draft;
   }
 }
 
@@ -383,13 +617,11 @@ function createRuntime({ me = 'student@school.example.org', rewriteUrl = (u) => 
       Charset: { UTF_8: 'UTF_8', US_ASCII: 'US_ASCII' },
       DigestAlgorithm: { SHA_256: 'sha256' },
       base64Decode: (s) => toSignedBytes(Buffer.from(s, 'base64')),
-      base64Encode: (bytes) => Buffer.from(bytes.map((b) => b & 0xff)).toString('base64'),
+      base64Encode: (data) => toBuffer(data).toString('base64'),
+      base64EncodeWebSafe: (data) => toBuffer(data).toString('base64').replace(/\+/g, '-').replace(/\//g, '_'),
       computeDigest: (alg, value) => signed(crypto.createHash(alg).update(String(value), 'utf8').digest()),
       computeHmacSha256Signature: (value, key) => signed(crypto.createHmac('sha256', String(key)).update(String(value), 'utf8').digest()),
-      newBlob: (bytes) => ({
-        getDataAsString: (charset) => new TextDecoder(String(charset || 'utf-8').toLowerCase(), { fatal: false })
-          .decode(Buffer.from(bytes.map((b) => b & 0xff))),
-      }),
+      newBlob: (data, contentType, name) => makeBlob(data, contentType, name),
     },
     ScriptApp: {
       newTrigger: (fn) => ({
@@ -419,4 +651,4 @@ function createRuntime({ me = 'student@school.example.org', rewriteUrl = (u) => 
   return rt;
 }
 
-module.exports = { createRuntime, SimulatedKill };
+module.exports = { createRuntime, SimulatedKill, parseMime, decodeWords };

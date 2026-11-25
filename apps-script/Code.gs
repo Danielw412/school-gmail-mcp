@@ -3,10 +3,12 @@
  *
  * Runs under the school Google account. Every minute (installTrigger) it:
  *   1. reports any outbound-action results that could not be delivered earlier,
- *   2. polls the Linux backend for pending send/reply actions (and, in relay mode,
- *      attachment downloads) and performs them,
+ *   2. polls the Linux backend for pending actions (send, reply, forward, drafts,
+ *      mailbox changes such as read/unread, labels, archive and trash; in relay
+ *      mode also attachment downloads) and performs them,
  *   3. reads Gmail changes since the last run (Gmail history API) and pushes new
- *      messages and label/read-state changes to the backend in bounded batches.
+ *      messages and label/read-state changes to the backend in bounded batches,
+ *   4. sends the list of drafts in the Drafts folder when it may have changed.
  * Deployed as a web app, doPost also downloads single attachments on demand for
  * the backend (signed requests; see "Attachments" below).
  *
@@ -26,7 +28,7 @@
  *   resetSyncState
  */
 
-var VERSION = '1.1.0';
+var VERSION = '1.3.0';
 
 var DEFAULTS = {
   RUN_BUDGET_MS: 45000,          // trigger runs stop starting new work after this
@@ -52,6 +54,11 @@ var PROP = {
   BACKOFF: 'SES_BACKOFF',        // {until, failures} while the backend is unreachable
   JOURNAL: 'SES_J_'              // + action ID: local record of outbound actions
 };
+
+// Actions that are safe to perform twice: if the script died while performing
+// one, it is retried instead of being reported as an uncertain failure.
+var IDEMPOTENT_ACTIONS = { modify: true, draft_delete: true };
+var DRAFTS_REFRESH_MS = 30 * 60000; // full drafts list at least this often
 
 var DAY_MS = 86400000;
 var JOURNAL_MAX_AGE_MS = 14 * DAY_MS;
@@ -155,7 +162,8 @@ function newRun_(manual) {
     savedQueue: all[PROP.QUEUE] || '',
     stats: {
       historyChanges: 0, stateUpdated: 0, fetched: 0, inserted: 0, updated: 0, unchanged: 0,
-      rejected: 0, skipped: 0, actionsDone: 0, actionsFailed: 0, attachmentsSent: 0, attachmentMeta: 0
+      rejected: 0, skipped: 0, actionsDone: 0, actionsFailed: 0, attachmentsSent: 0, attachmentMeta: 0,
+      draftsStored: 0
     }
   };
 }
@@ -263,6 +271,7 @@ function runSync_(manual) {
     processActions_(run);
     refreshLabelsIfDue_(run);
     syncMail_(run);
+    syncDrafts_(run);
     if (run.all[PROP.BACKOFF]) run.props.deleteProperty(PROP.BACKOFF);
   } catch (e) {
     persist_(run);
@@ -308,6 +317,7 @@ function logSummary_(run, force) {
   if (s.rejected) parts.push('rejected ' + s.rejected);
   if (s.actionsDone || s.actionsFailed) parts.push('actions ok ' + s.actionsDone + ' failed ' + s.actionsFailed);
   if (s.attachmentsSent) parts.push('attachments sent ' + s.attachmentsSent);
+  if (s.draftsStored) parts.push('drafts updated ' + s.draftsStored);
   if (run.queue.length) parts.push('queued ' + run.queue.length);
   if (run.state.sweep) parts.push(run.state.sweep.kind + ' scan in progress (' + run.state.sweep.scanned + ' checked)');
   if (run.state.attScan) parts.push('attachment scan in progress (' + run.state.attScan.scanned + ' checked, ' +
@@ -383,13 +393,15 @@ function reportJournal_(run, id, entry) {
     if (entry.s === 'sent') {
       api_(run, 'post', path + '/complete', { claimId: entry.c || '', result: entry.r || {} });
       run.stats.actionsDone++;
-      console.log('action ' + id + ' (' + entry.type + '): sent as message ' + (entry.r && entry.r.messageId));
+      console.log('action ' + id + ' (' + entry.type + '): ' + doneText_(entry.type, entry.r || {}));
     } else {
       var uncertain = entry.s === 'attempting';
-      var msg = uncertain
-        ? 'outcome unknown: the script stopped while performing this action, so it was not retried (check the Sent folder)'
-        : entry.e;
-      api_(run, 'post', path + '/fail', { claimId: entry.c, error: msg, retryable: !uncertain && !!entry.retry });
+      var repeatable = uncertain && !!IDEMPOTENT_ACTIONS[entry.type];
+      var msg = !uncertain ? entry.e : repeatable
+        ? 'the script stopped while performing this action; it is safe to repeat, so it will be retried'
+        : 'outcome unknown: the script stopped while performing this action, so it was not retried (check the ' +
+          (isDraftAction_(entry.type) || entry.type === 'draft_delete' ? 'Drafts' : 'Sent') + ' folder)';
+      api_(run, 'post', path + '/fail', { claimId: entry.c, error: msg, retryable: repeatable || (!uncertain && !!entry.retry) });
       run.stats.actionsFailed++;
       console.warn('action ' + id + ' (' + entry.type + '): ' + (uncertain ? 'uncertain' : 'failed') + ' - ' + msg);
     }
@@ -427,25 +439,300 @@ function flushJournal_(run) {
   });
 }
 
+function isDraftAction_(type) {
+  return type === 'draft' || type === 'draft_reply' || type === 'draft_forward' || type === 'draft_update';
+}
+
+/** One line for the log about a completed action. */
+function doneText_(type, r) {
+  if (type === 'modify') {
+    return 'changed ' + (r.modified || 0) + ' email(s)/conversation(s)' +
+      (r.missing && r.missing.length ? '; ' + r.missing.length + ' no longer in Gmail' : '');
+  }
+  if (type === 'draft_delete') return 'draft deleted';
+  return (isDraftAction_(type) ? 'saved as draft ' : 'sent as message ') + r.messageId;
+}
+
+/**
+ * send/reply/forward: creates a Gmail draft and sends it. draft/draft_reply/
+ * draft_forward: creates the same draft and leaves it in the Drafts folder for
+ * the user to review and send. modify changes labels (read state, star, inbox,
+ * trash); draft_update/draft_send/draft_delete act on an existing draft.
+ */
 function performAction_(action) {
   var p = action.payload || {};
+  switch (action.type) {
+    case 'modify': return performModify_(p);
+    case 'draft_update': return performDraftUpdate_(p);
+    case 'draft_send': return performDraftSend_(p);
+    case 'draft_delete': return performDraftDelete_(p);
+  }
   var opts = {};
   if (p.cc && p.cc.length) opts.cc = p.cc.join(',');
   if (p.bcc && p.bcc.length) opts.bcc = p.bcc.join(',');
   if (p.htmlBody) opts.htmlBody = p.htmlBody;
+  var files = loadAttachments_(p.attachments);
+  if (files.length) opts.attachments = files;
   var draft;
-  if (action.type === 'send') {
-    if (!p.to || !p.to.length) throw new Error('send: no recipients');
-    draft = GmailApp.createDraft(p.to.join(','), p.subject || '', p.body || '', opts);
-  } else if (action.type === 'reply') {
+  if (action.type === 'send' || action.type === 'draft') {
+    if (action.type === 'send' && (!p.to || !p.to.length)) throw new Error('send: no recipients');
+    draft = GmailApp.createDraft((p.to || []).join(','), p.subject || '', p.body || '', opts);
+  } else if (action.type === 'reply' || action.type === 'draft_reply') {
     var target = findReplyTarget_(p);
     // Draft replies stay in the original Gmail thread (same subject and references).
     draft = p.replyAll ? target.createDraftReplyAll(p.body || '', opts) : target.createDraftReply(p.body || '', opts);
+  } else if (action.type === 'forward' || action.type === 'draft_forward') {
+    if (action.type === 'forward' && (!p.to || !p.to.length)) throw new Error('forward: no recipients');
+    draft = createForwardDraft_(p, opts);
   } else {
     throw new Error('unsupported action type: ' + action.type);
   }
+  if (isDraftAction_(action.type)) {
+    var saved = draft.getMessage();
+    return { messageId: saved.getId(), threadId: saved.getThread().getId(), draftId: draft.getId() };
+  }
   var sent = draft.send();
   return { messageId: sent.getId(), threadId: sent.getThread().getId() };
+}
+
+/** Downloads files from other emails (payload.attachments) as blobs to attach. */
+function loadAttachments_(refs) {
+  return (refs || []).map(function (r) {
+    var a = downloadAttachment_(String(r.messageId || ''), String(r.attachmentId || ''), ATTACHMENT_MAX_BYTES);
+    return Utilities.newBlob(Utilities.base64Decode(a.data), a.mimeType || 'application/octet-stream', a.filename || 'attachment');
+  });
+}
+
+function escapeHtml_(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/**
+ * A forward as a new draft: the note, Gmail's "Forwarded message" header block
+ * and the original text and HTML, with the original's attachments (inline
+ * pictures of the original HTML are not carried over).
+ */
+function createForwardDraft_(p, opts) {
+  var m = null;
+  try {
+    m = GmailApp.getMessageById(p.messageId);
+  } catch (e) {
+    if (isTransientGmailError_(e)) throw e;
+  }
+  if (!m) throw new Error('forward: message ' + p.messageId + ' was not found in Gmail');
+  var subject = String(m.getSubject() || '');
+  if (!/^\s*(fwd?|fw)\s*:/i.test(subject)) subject = 'Fwd: ' + subject;
+  var lines = [
+    '---------- Forwarded message ---------',
+    'From: ' + m.getFrom(),
+    'Date: ' + (m.getHeader('Date') || String(m.getDate())),
+    'Subject: ' + m.getSubject(),
+    'To: ' + m.getTo()
+  ];
+  if (m.getCc()) lines.push('Cc: ' + m.getCc());
+  var note = String(p.body || '');
+  var text = (note ? note + '\n\n' : '') + lines.join('\n') + '\n\n' + m.getPlainBody();
+  opts.htmlBody = (note ? '<div>' + escapeHtml_(note).replace(/\n/g, '<br>') + '</div><br>' : '') +
+    '<div class="gmail_quote">' + lines.map(escapeHtml_).join('<br>') + '<br><br>' + m.getBody() + '</div>';
+  opts.attachments = m.getAttachments({ includeInlineImages: false }).concat(opts.attachments || []);
+  return GmailApp.createDraft((p.to || []).join(','), subject, text, opts);
+}
+
+/**
+ * Adds/removes labels on emails (batchModify) and conversations, then moves them
+ * to or from the trash. IDs Gmail no longer has are reported, not fatal.
+ */
+function performModify_(p) {
+  var add = p.addLabelIds || [];
+  var remove = p.removeLabelIds || [];
+  var missing = [];
+  var gone = {};
+  var lost = function (id, e) {
+    if (!isNotFound_(e)) throw e;
+    if (!gone[id]) missing.push(id);
+    gone[id] = true;
+  };
+  var msgIds = (p.messageIds || []).filter(function (id) { return ID_RE.test(id); });
+  var threadIds = (p.threadIds || []).filter(function (id) { return ID_RE.test(id); });
+  if (add.length || remove.length) {
+    if (msgIds.length) {
+      try {
+        Gmail.Users.Messages.batchModify({ ids: msgIds, addLabelIds: add, removeLabelIds: remove }, 'me');
+      } catch (e) {
+        if (isTransientGmailError_(e)) throw e;
+        // One unknown ID fails the whole batch: change them one at a time.
+        msgIds.forEach(function (id) {
+          try {
+            Gmail.Users.Messages.modify({ addLabelIds: add, removeLabelIds: remove }, 'me', id);
+          } catch (e2) { lost(id, e2); }
+        });
+      }
+    }
+    threadIds.forEach(function (id) {
+      try {
+        Gmail.Users.Threads.modify({ addLabelIds: add, removeLabelIds: remove }, 'me', id);
+      } catch (e) { lost(id, e); }
+    });
+  }
+  if (p.trash || p.untrash) {
+    var op = p.trash ? 'trash' : 'untrash';
+    msgIds.forEach(function (id) {
+      if (gone[id]) return;
+      try { Gmail.Users.Messages[op]('me', id); } catch (e) { lost(id, e); }
+    });
+    threadIds.forEach(function (id) {
+      if (gone[id]) return;
+      try { Gmail.Users.Threads[op]('me', id); } catch (e) { lost(id, e); }
+    });
+  }
+  return { modified: msgIds.length + threadIds.length - missing.length, missing: missing };
+}
+
+/**
+ * Reads a draft. With expectedMessageId, refuses one that was edited since the
+ * backend last saw it (its message ID changes on every edit). Null if gone.
+ */
+function getDraftChecked_(draftId, expectedMessageId, format) {
+  if (!ID_RE.test(String(draftId || ''))) throw new Error('invalid draft id');
+  var d;
+  try {
+    d = Gmail.Users.Drafts.get('me', draftId, { format: format || 'minimal' });
+  } catch (e) {
+    if (isNotFound_(e)) return null;
+    throw e;
+  }
+  var current = d && d.message && d.message.id;
+  if (expectedMessageId && current !== expectedMessageId) {
+    throw new Error('the draft was changed in Gmail after it was read; read it again (get_draft) before changing or sending it');
+  }
+  return d;
+}
+
+function performDraftSend_(p) {
+  if (!getDraftChecked_(p.draftId, p.draftMessageId)) {
+    throw new Error('draft ' + p.draftId + ' is no longer in Gmail (already sent or deleted)');
+  }
+  var sent = Gmail.Users.Drafts.send({ id: p.draftId }, 'me');
+  return { messageId: sent.id, threadId: sent.threadId };
+}
+
+function performDraftDelete_(p) {
+  if (!getDraftChecked_(p.draftId, p.draftMessageId)) return {}; // already gone
+  try {
+    Gmail.Users.Drafts.remove('me', p.draftId);
+  } catch (e) {
+    if (!isNotFound_(e)) throw e;
+  }
+  return {};
+}
+
+/**
+ * Replaces a draft's recipients, subject and text, keeping it in its
+ * conversation (thread and reply headers) and keeping its attachments unless
+ * dropAttachments. Built as a MIME message for the Gmail API, which (unlike
+ * GmailDraft.update) keeps the thread.
+ */
+function performDraftUpdate_(p) {
+  var d = getDraftChecked_(p.draftId, p.draftMessageId, 'full');
+  if (!d) throw new Error('draft ' + p.draftId + ' is no longer in Gmail (sent or deleted)');
+  var msg = d.message;
+  var hdr = headerMap_((msg.payload || {}).headers);
+  var files = [];
+  if (!p.dropAttachments) {
+    attachmentParts_(msg, null, null).forEach(function (x, i) {
+      if (x.meta.inline && x.meta.contentId && x.meta.mimeType.indexOf('image/') === 0) return; // belonged to the old HTML
+      files.push(downloadAttachment_(msg.id, x.meta.partId || '#' + i, ATTACHMENT_MAX_BYTES));
+    });
+  }
+  (p.attachments || []).forEach(function (r) {
+    files.push(downloadAttachment_(String(r.messageId || ''), String(r.attachmentId || ''), ATTACHMENT_MAX_BYTES));
+  });
+  var mime = buildMime_({
+    to: p.to, cc: p.cc, bcc: p.bcc, subject: p.subject || '', text: p.body || '', html: p.htmlBody || '',
+    inReplyTo: hdr['in-reply-to'] || '', references: hdr['references'] || '', files: files
+  });
+  var res = Gmail.Users.Drafts.update({
+    id: p.draftId,
+    message: { raw: Utilities.base64EncodeWebSafe(mime, Utilities.Charset.UTF_8), threadId: msg.threadId }
+  }, 'me', p.draftId);
+  var m = (res && res.message) || {};
+  return { messageId: m.id, threadId: m.threadId || msg.threadId, draftId: (res && res.id) || p.draftId };
+}
+
+// ---------------------------------------------------------------------------
+// MIME (only for draft edits; GmailApp builds everything else)
+
+function oneLine_(s) {
+  return String(s || '').replace(/[\r\n]+/g, ' ');
+}
+
+/** RFC 2047 encoded words for a header value that is not plain ASCII. */
+function encodeWords_(s) {
+  s = oneLine_(s);
+  if (/^[\x20-\x7e]*$/.test(s)) return s;
+  var chars = Array.from(s);
+  var words = [];
+  for (var i = 0; i < chars.length; i += 10) {
+    words.push('=?UTF-8?B?' + Utilities.base64Encode(chars.slice(i, i + 10).join(''), Utilities.Charset.UTF_8) + '?=');
+  }
+  return words.join('\r\n ');
+}
+
+/** "Name <addr>" with a non-ASCII name gets an encoded name. */
+function encodeAddress_(a) {
+  a = oneLine_(a).trim();
+  if (/^[\x20-\x7e]*$/.test(a)) return a;
+  var m = /^"?(.*?)"?\s*<([^<>]+)>$/.exec(a);
+  return m ? encodeWords_(m[1]) + ' <' + m[2] + '>' : a;
+}
+
+function wrap76_(b64) {
+  return b64.replace(/(.{76})/g, '$1\r\n');
+}
+
+function mimePart_(headers, content) {
+  return { headers: headers, content: content };
+}
+
+function multipart_(kind, parts) {
+  var boundary = '=_ses_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
+  var content = parts.map(function (p) {
+    return '--' + boundary + '\r\n' + p.headers.join('\r\n') + '\r\n\r\n' + p.content;
+  }).join('\r\n') + '\r\n--' + boundary + '--';
+  return mimePart_(['Content-Type: multipart/' + kind + '; boundary="' + boundary + '"'], content);
+}
+
+function textPart_(type, text) {
+  return mimePart_(['Content-Type: text/' + type + '; charset=UTF-8', 'Content-Transfer-Encoding: base64'],
+    wrap76_(Utilities.base64Encode(text, Utilities.Charset.UTF_8)));
+}
+
+function filePart_(f) {
+  var name = oneLine_(f.filename || 'attachment').replace(/["\\]/g, '_');
+  var ascii = /^[\x20-\x7e]*$/.test(name);
+  var plain = ascii ? name : name.replace(/[^\x20-\x7e]/g, '_');
+  var type = oneLine_(f.mimeType || 'application/octet-stream').replace(/[";\\]/g, '');
+  return mimePart_([
+    'Content-Type: ' + type + '; name="' + plain + '"',
+    'Content-Disposition: attachment; filename="' + plain + '"' + (ascii ? '' : "; filename*=UTF-8''" + encodeURIComponent(name)),
+    'Content-Transfer-Encoding: base64'
+  ], wrap76_(f.data));
+}
+
+/** m: {to, cc, bcc (arrays), subject, text, html, inReplyTo, references, files [{filename, mimeType, data (base64)}]}. */
+function buildMime_(m) {
+  var lines = [];
+  [['To', m.to], ['Cc', m.cc], ['Bcc', m.bcc]].forEach(function (h) {
+    if (h[1] && h[1].length) lines.push(h[0] + ': ' + h[1].map(encodeAddress_).join(', '));
+  });
+  lines.push('Subject: ' + encodeWords_(m.subject));
+  if (m.inReplyTo) lines.push('In-Reply-To: ' + oneLine_(m.inReplyTo));
+  if (m.references) lines.push('References: ' + oneLine_(m.references));
+  lines.push('MIME-Version: 1.0');
+  var body = textPart_('plain', m.text || '');
+  if (m.html) body = multipart_('alternative', [body, textPart_('html', m.html)]);
+  if (m.files && m.files.length) body = multipart_('mixed', [body].concat(m.files.map(filePart_)));
+  return lines.concat(body.headers).join('\r\n') + '\r\n\r\n' + body.content;
 }
 
 function findReplyTarget_(p) {
@@ -712,6 +999,83 @@ function drainQueue_(run) {
     chars += size;
   }
   flush();
+}
+
+/**
+ * Sends the Drafts folder to the backend: the list of drafts (cheap: IDs only)
+ * whenever Gmail changed or an action ran, at least every 30 minutes, and the
+ * content of the drafts the backend asks for (new or edited ones).
+ */
+function syncDrafts_(run) {
+  var st = run.state;
+  var stale = !st.draftsAt || Date.now() - st.draftsAt > DRAFTS_REFRESH_MS;
+  if (!(stale || st.draftsNeed || run.stats.historyChanges || run.stats.actionsDone) || timeLeft_(run) < 15000) return;
+  var refs = [];
+  var pageToken = '';
+  do {
+    var opts = { maxResults: 100 };
+    if (pageToken) opts.pageToken = pageToken;
+    var resp = Gmail.Users.Drafts.list('me', opts);
+    (resp.drafts || []).forEach(function (d) {
+      var m = d && d.message;
+      if (!m || !ID_RE.test(String(d.id)) || !ID_RE.test(String(m.id))) return;
+      refs.push({ id: String(d.id), messageId: String(m.id), threadId: ID_RE.test(String(m.threadId || '')) ? String(m.threadId) : '' });
+    });
+    pageToken = resp.nextPageToken || '';
+  } while (pageToken && refs.length < 500);
+  refs = refs.slice(0, 500);
+  var fp = sha256Hex_(JSON.stringify(refs)).slice(0, 16);
+  if (fp === st.draftsFp && !st.draftsNeed && !stale) return;
+
+  var res;
+  try {
+    res = api_(run, 'post', '/v1/sync/drafts', { drafts: refs, messages: [] });
+  } catch (e) {
+    if (!(e instanceof BackendRejectedError && e.status === 404)) throw e;
+    console.warn('drafts: the backend does not accept the drafts list yet (update the backend); trying again in 30 minutes');
+    st.draftsAt = Date.now();
+    st.draftsFp = fp;
+    persist_(run);
+    return;
+  }
+  var need = res.need || [];
+  var byId = {};
+  refs.forEach(function (r) { byId[r.id] = r; });
+  var batch = [];
+  var chars = 0;
+  var done = 0;
+  var flush = function () {
+    if (!batch.length) return;
+    var r = api_(run, 'post', '/v1/sync/drafts', { drafts: refs, messages: batch });
+    run.stats.draftsStored += r.stored || 0;
+    batch = [];
+    chars = 0;
+  };
+  for (var i = 0; i < need.length && timeLeft_(run) > 12000; i++) {
+    var ref = byId[need[i]];
+    if (!ref) continue;
+    var d;
+    try {
+      d = Gmail.Users.Drafts.get('me', ref.id, { format: 'full' });
+    } catch (e) {
+      if (isTransientGmailError_(e)) throw e;
+      done++; // deleted meanwhile; the next list drops it
+      continue;
+    }
+    if (!d || !d.message || !ID_RE.test(String(d.message.id))) continue;
+    ref.messageId = String(d.message.id); // edited since it was listed: send the newest
+    var n = normalizeMessage_(d.message, run.cfg);
+    var size = (n.bodyText || '').length + (n.bodyHtml || '').length + 4000;
+    if (batch.length && (batch.length >= 10 || chars + size > run.cfg.BATCH_MAX_CHARS)) flush();
+    batch.push(n);
+    chars += size;
+    done++;
+  }
+  flush();
+  st.draftsAt = Date.now();
+  st.draftsFp = fp;
+  st.draftsNeed = done < need.length;
+  persist_(run);
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,6 +1555,7 @@ function showStatus() {
     'last successful run: ' + (st.lastOkAt ? new Date(st.lastOkAt).toISOString() : 'never'),
     'scan: ' + (st.sweep ? st.sweep.kind + ', ' + st.sweep.scanned + ' checked' : 'none'),
     'attachment scan: ' + (st.attScan ? st.attScan.scanned + ' checked, ' + st.attScan.updated + ' updated' : 'none'),
+    'drafts list sent: ' + (st.draftsAt ? new Date(st.draftsAt).toISOString() : 'never'),
     'ATTACHMENT_FETCH_SECRET ' + (all.ATTACHMENT_FETCH_SECRET ? 'set' : '(not set: web app disabled, relay only)'),
     'queued messages: ' + queue.length,
     'unreported actions: ' + journal.length,

@@ -4,17 +4,28 @@ This folder is the half of the system that runs **inside your school Google
 account**. It is the only part that touches Gmail or holds Google credentials. Every
 minute it:
 
-1. polls the Linux backend for queued **send / reply** actions, performs them with
-   `GmailApp`, and reports success or failure;
+1. polls the Linux backend for queued actions (**send, reply, forward, drafts, draft
+   edits, and mailbox changes** such as read/unread, star, labels, archive and trash),
+   performs them in Gmail, and reports success or failure;
 2. reads Gmail changes since the last run (Gmail history API) and pushes new
-   messages plus read/label changes to the backend in batches of at most 20.
+   messages plus read/label changes to the backend in batches of at most 20;
+3. when Gmail changed, sends the list of drafts in your Drafts folder (and the text of
+   new or edited drafts) so agents can read, edit, send or delete them.
 
 When an agent asks for an attachment, the script also downloads that one file for
 the backend: through its web app endpoint if you deploy one (step 9), otherwise with
 the next trigger run.
 
-It only reads mail, sends mail and creates drafts it sends right away. It never
-deletes, archives, labels or marks mail as read.
+What it changes in Gmail, and only when an action was queued (by you through ChatGPT,
+which asks you to confirm each one, or by a local tool on the server):
+
+* sends mail, replies and forwards, and creates, edits, sends or deletes drafts;
+* marks mail read or unread, stars, marks important, archives or moves to the inbox,
+  adds or removes **existing** labels, and moves mail to or from the trash.
+
+It never permanently deletes mail (trash is Gmail's 30-day trash), never empties the
+trash or spam, and never creates or deletes labels. Deleting a draft is permanent, as
+in Gmail, so those requests wait out the same cancel window as sending.
 
 Files to copy:
 
@@ -183,7 +194,7 @@ use relay mode: leave `ATTACHMENT_FETCH_URL` out of `backend.env`. *Anyone withi
    `/exec`; never use the `/dev` test URL).
 4. Check the access setting: open the URL in a private/incognito window. You should
    see `{"ok":false,"error":{"code":"method","message":"School Email Sync attachment
-   endpoint 1.1.0: POST only"}}`. A Google sign-in page means the deployment is not
+   endpoint 1.3.0: POST only"}}`. A Google sign-in page means the deployment is not
    public, and the backend will not be able to use it.
 5. In `~/.config/school-email-sync/backend.env` on the server:
 
@@ -251,6 +262,9 @@ just their attachment metadata. `showStatus` shows the progress; the log says
   fail immediately.
 * **Replies** use Gmail's draft-reply functions, so they stay in the original
   conversation with the same subject and references.
+* **Drafts** (`create_draft`): the same draft is created but not sent; it stays in
+  your Drafts folder (a draft reply stays in its conversation). Drafts are not
+  synced back to the backend (`SKIP_LABELS` includes `DRAFT`).
 * **Logging:** one summary line per run that did something, plus warnings and errors.
   Message bodies are never logged.
 
@@ -266,6 +280,9 @@ are reported as retryable and retried later.
 ## Updating
 
 Paste the new `Code.gs` over the old one and save. Script Properties, the trigger
-and the sync state are kept. If `appsscript.json` changed, update it too and run
+and the sync state are kept. Version 1.3.0 (mailbox changes, forwarding, attachments
+on outgoing mail, drafts) needs no new permissions: the existing `https://mail.google.com/`
+scope covers them. Update the backend first; an older backend makes 1.3.0 log
+"does not accept the drafts list yet" every 30 minutes until it is updated. If `appsscript.json` changed, update it too and run
 any function once to accept new permissions. If you use the attachment web app,
 publish a new version of its deployment (step 9).

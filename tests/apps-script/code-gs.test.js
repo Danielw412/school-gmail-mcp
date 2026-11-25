@@ -370,6 +370,42 @@ test('send and reply actions are performed in Gmail, threaded, and reported', as
   assert.ok(thread.body.messages.some((m) => m.id === reply.id), 'reply should be stored in the original thread');
 });
 
+test('draft actions are saved in Gmail Drafts, never sent, and reported', async () => {
+  const box = rt.mailbox;
+  const plainThread = box.msgs.get(ids.plain).threadId;
+  const draftId = await queueAction({
+    type: 'draft', to: ['rivera@school.example.org'], subject: 'Question about homework', body: 'Hi Ms. Rivera,',
+  });
+  const blankId = await queueAction({ type: 'draft', body: 'notes to self' });
+  const replyId = await queueAction({ type: 'draft_reply', messageId: ids.plain, body: 'Thanks, see you then.', replyAll: true });
+
+  const sentBefore = box.sent.length;
+  const draftsBefore = box.drafts.length;
+  rt.call('syncTick');
+  assert.equal(box.sent.length, sentBefore, 'drafts must not be sent');
+  assert.equal(box.drafts.length, draftsBefore + 3);
+  const [draft, blank, reply] = box.drafts.slice(draftsBefore);
+  assert.equal(draft.to, 'rivera@school.example.org');
+  assert.equal(draft.subject, 'Question about homework');
+  assert.equal(blank.to, '');
+  assert.equal(reply.threadId, plainThread);
+  assert.equal(reply.replyAll, true);
+
+  for (const [actionId, d] of [[draftId, draft], [blankId, blank], [replyId, reply]]) {
+    const a = await action(actionId);
+    assert.equal(a.status, 'done');
+    assert.equal(a.result.messageId, d.id);
+    assert.equal(a.result.threadId, d.threadId);
+    assert.equal(a.result.draftId, d.draftId);
+    assert.ok(box.msgs.get(d.id).labelIds.includes('DRAFT'));
+  }
+  assert.deepEqual(journalKeys(), []);
+  assert.match(rt.logText(), /saved as draft/);
+
+  rt.call('syncTick'); // drafts appear in Gmail history but are skipped (SKIP_LABELS)
+  assert.equal((await message(draft.id)).status, 404);
+});
+
 test('Gmail send failures are reported as permanent or retryable', async () => {
   const box = rt.mailbox;
   const bad = await queueAction({ type: 'send', to: ['nobody@example.org'], subject: 'x', body: 'y' });
@@ -690,3 +726,228 @@ test('startAttachmentBackfill fills in metadata for stored mail from the MIME st
   assert.match(rt.logText(), /attachment scan finished/);
   assert.equal(JSON.parse(rt.props.get('SES_STATE')).attScan, null);
 });
+
+// ---------------------------------------------------------------------------
+// Mailbox changes, forwarding, outgoing attachments and drafts (Code.gs 1.3.0)
+
+test('mailbox changes (read state, star, labels, archive, trash) are applied in Gmail and confirmed by sync', async () => {
+  const box = rt.mailbox;
+  const a = box.add({ subject: 'Club fundraiser', text: 'Bake sale', labelIds: ['INBOX', 'UNREAD'] });
+  const b1 = box.add({ subject: 'Group project', text: 'Part 1', labelIds: ['INBOX', 'UNREAD'] });
+  const b2 = box.add({ subject: 'Re: Group project', text: 'Part 2', threadId: box.msgs.get(b1).threadId, labelIds: ['INBOX', 'UNREAD'] });
+  const c = box.add({ subject: 'Spammy newsletter', text: 'Buy now', labelIds: ['INBOX'] });
+  rt.call('syncTick');
+  const thread = box.msgs.get(b1).threadId;
+
+  const readId = await queueAction({ type: 'modify', messageIds: [a], removeLabelIds: ['UNREAD'], addLabelIds: ['STARRED', 'Label_1'] });
+  const archiveId = await queueAction({ type: 'modify', threadIds: [thread], removeLabelIds: ['INBOX', 'UNREAD'] });
+  const trashId = await queueAction({ type: 'modify', messageIds: [c, '19ffffffffffffff'], trash: true });
+  assert.equal((await message(a)).body.message.unread, false, 'the local copy changes when the action is queued');
+
+  rt.clearLogs();
+  rt.call('syncTick');
+  assert.deepEqual(box.msgs.get(a).labelIds.sort(), ['INBOX', 'Label_1', 'STARRED']);
+  for (const id of [b1, b2]) assert.deepEqual(box.msgs.get(id).labelIds, []);
+  assert.ok(box.msgs.get(c).labelIds.includes('TRASH'));
+  assert.equal((await action(readId)).status, 'done');
+  assert.equal((await action(archiveId)).result.modified, 1);
+  const trash = await action(trashId);
+  assert.equal(trash.status, 'done');
+  assert.equal(trash.result.modified, 1);
+  assert.deepEqual(trash.result.missing, ['19ffffffffffffff']);
+  assert.match(rt.logText(), /changed 1 email/);
+  assert.match(rt.logText(), /1 no longer in Gmail/);
+
+  rt.call('syncTick'); // the changes come back through Gmail history and agree
+  const m = (await message(a)).body.message;
+  assert.equal(m.starred, true);
+  assert.equal(m.unread, false);
+  assert.deepEqual(m.labels.sort(), ['INBOX', 'Robotics', 'STARRED']);
+  assert.equal((await message(b2)).body.message.inInbox, false);
+  assert.equal((await message(c)).body.message.inTrash, true);
+
+  // An unknown ID in a label change falls back to one-by-one changes.
+  const mixedId = await queueAction({ type: 'modify', messageIds: [c, '19eeeeeeeeeeeeee'], untrash: true, addLabelIds: ['INBOX'] });
+  rt.call('syncTick');
+  const mixed = await action(mixedId);
+  assert.equal(mixed.status, 'done', mixed.lastError);
+  assert.deepEqual(mixed.result.missing, ['19eeeeeeeeeeeeee']);
+  assert.deepEqual(box.msgs.get(c).labelIds, ['INBOX']);
+  assert.deepEqual(journalKeys(), []);
+});
+
+test('a run that dies mid-change retries it: mailbox changes are safe to repeat', async () => {
+  const box = rt.mailbox;
+  const id = box.add({ subject: 'Repeatable', text: 'x', labelIds: ['INBOX', 'UNREAD'] });
+  rt.call('syncTick');
+  const actId = await queueAction({ type: 'modify', messageIds: [id], removeLabelIds: ['UNREAD'] });
+  rt.killOnProperty = (k, v) => k.startsWith('SES_J_') && v.includes('"s":"sent"');
+  assert.throws(() => rt.call('syncTick'), /Simulated execution kill/);
+  rt.call('syncTick');
+  const a = await action(actId);
+  assert.equal(a.status, 'pending', 'an interrupted mailbox change is retried');
+  assert.match(a.lastError, /safe to repeat/);
+  assert.equal((await api('POST', '/v1/actions/' + actId + '/cancel')).status, 200);
+  assert.deepEqual(journalKeys(), []);
+});
+
+test('forwards include the original and its files; files from other emails can be attached', async () => {
+  const box = rt.mailbox;
+  const src = box.add({
+    subject: 'Signed permission slip', text: 'Here is the slip.', html: '<p>Here is the slip.</p>', cc: 'office@school.example.org',
+    attachments: [{ filename: 'slip.pdf', mimeType: 'application/pdf', data: Buffer.from('%PDF-1.4 slip') }],
+  });
+  const other = box.add({
+    subject: 'Photos', text: 'See photo.',
+    attachments: [{ filename: 'photo é.jpg', mimeType: 'image/jpeg', data: Buffer.from([0xff, 0xd8, 0xff, 0x00, 0x01]) }],
+  });
+  rt.call('syncTick');
+
+  const fwdId = await queueAction({ type: 'forward', messageId: src, to: ['coach@school.example.org'], body: 'FYI <coach>', cc: ['mom@example.com'] });
+  const draftFwdId = await queueAction({ type: 'draft_forward', messageId: src, body: 'to finish later' });
+  const sendId = await queueAction({
+    type: 'send', to: ['teacher@school.example.org'], subject: 'Photo', body: 'Attached.',
+    attachments: [{ messageId: other, attachmentId: '1' }],
+  });
+  const replyId = await queueAction({ type: 'reply', messageId: src, body: 'Got it, thanks', attachments: [{ messageId: other, attachmentId: '1' }] });
+  const badId = await queueAction({ type: 'send', to: ['a@x.org'], subject: 's', body: 'b', attachments: [{ messageId: other, attachmentId: '7' }] });
+  const sentBefore = box.sent.length;
+  const draftsBefore = box.drafts.length;
+  rt.call('syncTick');
+
+  const sent = box.sent.slice(sentBefore);
+  const fwd = sent.find((x) => x.subject === 'Fwd: Signed permission slip');
+  assert.ok(fwd, JSON.stringify(sent.map((x) => x.subject)));
+  assert.equal(fwd.to, 'coach@school.example.org');
+  assert.equal(fwd.opts.cc, 'mom@example.com');
+  assert.match(fwd.body, /^FYI <coach>\n\n---------- Forwarded message ---------\nFrom: Ms\. Rivera/);
+  assert.match(fwd.body, /Cc: office@school\.example\.org\n\nHere is the slip\.$/);
+  assert.match(fwd.opts.htmlBody, /FYI &lt;coach&gt;.*<p>Here is the slip\.<\/p>/s);
+  assert.deepEqual(fwd.opts.attachments.map((f) => f.getName()), ['slip.pdf']);
+  assert.equal((await action(fwdId)).result.messageId, fwd.id);
+
+  const draft = box.drafts.slice(draftsBefore).find((x) => x.subject === 'Fwd: Signed permission slip');
+  assert.ok(draft, 'forward saved as a draft');
+  assert.equal((await action(draftFwdId)).result.draftId, draft.draftId);
+
+  const withFile = sent.find((x) => x.subject === 'Photo');
+  assert.equal(withFile.opts.attachments.length, 1);
+  assert.equal(withFile.opts.attachments[0].getName(), 'photo é.jpg');
+  assert.equal(withFile.opts.attachments[0].getContentType(), 'image/jpeg');
+  assert.deepEqual([...withFile.opts.attachments[0]._buf], [0xff, 0xd8, 0xff, 0x00, 0x01]);
+  assert.equal((await action(sendId)).status, 'done');
+  assert.equal(sent.find((x) => x.body === 'Got it, thanks').opts.attachments[0].getName(), 'photo é.jpg');
+  assert.equal((await action(replyId)).status, 'done');
+
+  const bad = await action(badId);
+  assert.equal(bad.status, 'failed');
+  assert.match(bad.lastError, /has no attachment 7/);
+});
+
+test('the Drafts folder is synced; edits keep the thread and files; drafts can be sent and deleted', async (t) => {
+  const box = rt.mailbox;
+  const orig = box.add({ subject: 'Lab report', text: 'Please send your lab report.' });
+  rt.call('syncTick');
+  const reply = box.addDraft({
+    threadId: box.msgs.get(orig).threadId, to: 'Ms. Rivera <rivera@school.example.org>', subject: 'Re: Lab report',
+    text: 'Here is my report (draft)', inReplyTo: `<${orig}@mail.example.org>`,
+    attachments: [{ filename: 'report.txt', mimeType: 'text/plain', data: Buffer.from('lab results') }],
+  });
+  const blank = box.addDraft({ to: '', subject: 'Ideas', text: 'notes to self' });
+
+  rt.requests.length = 0;
+  rt.call('syncTick');
+  assert.equal(rt.requests.filter((r) => r.path === '/v1/sync/drafts').length, 2, 'list, then the content asked for');
+  const listDrafts = async () => JSON.parse((await mcpCall('list_drafts', {})).content[0].text);
+  if (!E2E_URL) {
+    const out = await listDrafts();
+    const r = out.drafts.find((d) => d.draft_id === reply.draftId);
+    assert.ok(r, JSON.stringify(out));
+    assert.equal(r.is_reply, true);
+    assert.equal(r.subject, 'Re: Lab report');
+    assert.match(r.preview, /Here is my report/);
+    assert.deepEqual(r.attachments.map((f) => f.filename), ['report.txt']);
+  }
+
+  // Nothing changed: the next run neither posts the list nor reads drafts.
+  rt.requests.length = 0;
+  rt.call('syncTick');
+  assert.equal(rt.requests.filter((r) => r.path === '/v1/sync/drafts').length, 0);
+
+  // Edit: new recipients, subject and text; the thread, reply headers and file stay.
+  const updId = await queueAction({
+    type: 'draft_update', draftId: reply.draftId, draftMessageId: reply.id,
+    to: ['Ms. Rivera <rivera@school.example.org>', 'José Pérez <jose@example.com>'], cc: ['lab@school.example.org'],
+    subject: 'Re: Lab report ✓', body: 'Here is my final report.\nThanks!',
+  });
+  const oldMessageId = reply.id;
+  rt.call('syncTick');
+  let a = await action(updId);
+  assert.equal(a.status, 'done', a.lastError);
+  assert.equal(reply.updates, 1);
+  assert.notEqual(reply.id, oldMessageId);
+  assert.equal(a.result.messageId, reply.id);
+  assert.equal(a.result.draftId, reply.draftId);
+  assert.equal(box.msgs.get(reply.id).threadId, box.msgs.get(orig).threadId, 'the draft stays in its conversation');
+  const h = reply.parsed.headers;
+  assert.equal(h['in-reply-to'], `<${orig}@mail.example.org>`);
+  assert.match(h.to, /=\?UTF-8\?B\?/, 'non-ASCII names are encoded');
+  assert.equal(decodeWordsForTest(h.to), 'Ms. Rivera <rivera@school.example.org>, José Pérez <jose@example.com>');
+  assert.equal(decodeWordsForTest(h.subject), 'Re: Lab report ✓');
+  assert.equal(h.cc, 'lab@school.example.org');
+  assert.equal(reply.parsed.text, 'Here is my final report.\nThanks!');
+  assert.deepEqual(reply.parsed.files.map((f) => [f.filename, f.data.toString()]), [['report.txt', 'lab results']]);
+
+  rt.call('syncTick'); // the edited draft's new content is synced
+  if (!E2E_URL) {
+    const r = (await listDrafts()).drafts.find((d) => d.draft_id === reply.draftId);
+    assert.match(r.preview, /final report/);
+    assert.equal(r.subject, 'Re: Lab report ✓');
+  }
+
+  // A draft edited in Gmail after it was read is not overwritten.
+  const staleId = await queueAction({ type: 'draft_update', draftId: reply.draftId, draftMessageId: oldMessageId, body: 'stale' });
+  rt.call('syncTick');
+  a = await action(staleId);
+  assert.equal(a.status, 'failed');
+  assert.match(a.lastError, /changed in Gmail/);
+
+  // Remove the file; send one draft and delete the other.
+  const dropId = await queueAction({
+    type: 'draft_update', draftId: reply.draftId, draftMessageId: reply.id, to: ['rivera@school.example.org'],
+    subject: 'Re: Lab report', body: 'Report inline: results ok', dropAttachments: true,
+  });
+  rt.call('syncTick');
+  assert.equal((await action(dropId)).status, 'done');
+  assert.deepEqual(reply.parsed.files, []);
+
+  const sendId = await queueAction({ type: 'draft_send', draftId: reply.draftId, draftMessageId: reply.id });
+  const delId = await queueAction({ type: 'draft_delete', draftId: blank.draftId });
+  const sentBefore = box.sent.length;
+  rt.call('syncTick');
+  assert.equal(box.sent.length, sentBefore + 1);
+  const sent = box.sent[box.sent.length - 1];
+  assert.equal(sent.fromDraft, reply.draftId);
+  assert.equal(sent.threadId, box.msgs.get(orig).threadId);
+  assert.equal((await action(sendId)).result.messageId, sent.id);
+  assert.equal((await action(delId)).status, 'done');
+  assert.ok(blank.removed);
+  assert.equal(box.liveDrafts().some((d) => d.draftId === reply.draftId || d.draftId === blank.draftId), false);
+
+  // Deleting a draft that is already gone succeeds; sending one fails.
+  const again = await queueAction({ type: 'draft_delete', draftId: blank.draftId });
+  const gone = await queueAction({ type: 'draft_send', draftId: blank.draftId });
+  rt.call('syncTick');
+  assert.equal((await action(again)).status, 'done');
+  a = await action(gone);
+  assert.equal(a.status, 'failed');
+  assert.match(a.lastError, /no longer in Gmail/);
+
+  if (E2E_URL) return t.skip('draft list checked through MCP locally only');
+  const ids = (await listDrafts()).drafts.map((d) => d.draft_id);
+  assert.ok(!ids.includes(reply.draftId) && !ids.includes(blank.draftId), JSON.stringify(ids));
+});
+
+function decodeWordsForTest(s) {
+  return require('./gas-env').decodeWords(s);
+}

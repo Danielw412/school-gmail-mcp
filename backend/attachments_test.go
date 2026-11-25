@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -351,6 +352,49 @@ func TestMigrationV2FromV1(t *testing.T) {
 	}
 	if strings.Join(hidden, ",") != "2" {
 		t.Fatalf("hidden after migration: %v", hidden)
+	}
+}
+
+func TestMigrationV3KeepsActionsAndAllowsDrafts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mail.db")
+	db, err := sql.Open("sqlite3", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(schemaV1 + schemaV2 + `PRAGMA user_version = 2;
+		INSERT INTO actions (id, type, status, payload, idempotency_key, attempts, max_attempts, not_before, result, created_at, updated_at, finished_at)
+		VALUES ('act_old', 'send', 'done', '{"to":["a@x.org"],"subject":"s","body":"b"}', 'k1', 1, 5, 1, '{"messageId":"m1","threadId":"t1"}', 1, 2, 2);`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	old, err := s.GetAction(ctx, "act_old")
+	if err != nil || old.Status != "done" || old.IdempotencyKey != "k1" || string(old.Result) != `{"messageId":"m1","threadId":"t1"}` {
+		t.Fatalf("existing action after migration: %+v %v", old, err)
+	}
+	// The idempotency key is still unique.
+	if _, _, err := s.CreateAction(ctx, "draft", ActionPayload{Body: "x"}, "k1", 5, 10, 0); !errors.Is(err, errConflict) {
+		t.Fatalf("reused idempotency key: %v", err)
+	}
+	for _, typ := range []string{"draft", "draft_reply"} {
+		if _, _, err := s.CreateAction(ctx, typ, ActionPayload{Body: "x", MessageID: "m1"}, "", 5, 10, 0); err != nil {
+			t.Fatalf("create %s: %v", typ, err)
+		}
+	}
+	if _, err := s.db.Exec(`INSERT INTO actions (id, type, status, payload, max_attempts, not_before, created_at, updated_at)
+		VALUES ('bad', 'delete', 'pending', '{}', 1, 1, 1, 1)`); err == nil {
+		t.Fatal("unknown action type accepted")
+	}
+	var idx int
+	s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN ('actions_queue', 'actions_created')`).Scan(&idx)
+	if idx != 2 {
+		t.Fatalf("indexes after migration: %d", idx)
 	}
 }
 
